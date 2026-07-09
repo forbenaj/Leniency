@@ -1,5 +1,7 @@
 # Leniency
 
+![Lifeform preview](./assets/lifeforms/lifeform-4-o2-a.png)
+
 A small, dependency-free browser playground inspired by Lenia. It includes a live field canvas, growth/kernel views, mass tracing, presets, drawing tools, a searchable library from the original Lenia lifeforms, and core parameters for the continuous cellular automata loop.
 
 The large-field playground is in `range-playground.html`. That path is optimized for sparse lifeforms in a big world: simulation runs in a Web Worker, the field is split into 32 x 32 chunks, inactive chunks outside the safe viewport are dropped, field colors use a lookup table, and only dirty chunk patches are uploaded to the visible buffer.
