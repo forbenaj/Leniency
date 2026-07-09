@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Leniency Playground</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="src/styles.css" />
+    <script defer src="src/lenia-lifeforms.js"></script>
+    <script defer src="src/app.js"></script>
+  </head>
+  <body>
+    <main class="app-shell">
+      <aside class="library" aria-label="Lifeform catalogue">
+        <div class="panel-title">
+          <div>
+            <h2>Catalogue</h2>
+            <span id="libraryCount">0 species</span>
+          </div>
+        </div>
+
+        <table id="Catalogue" class="catalogue-table" aria-label="Featured categories"></table>
+        <div id="selectedForm" class="selected-form">No species selected</div>
+        <div id="AnimalWindow" class="animal-window">
+          <ul id="AnimalList" class="animal-list"></ul>
+        </div>
+      </aside>
+
+      <section class="stage" aria-label="Simulation playground">
+        <div class="brand-row">
+          <div>
+            <h1>Leniency</h1>
+            <p>Continuous cellular automata playground</p>
+          </div>
+          <div class="status-strip" aria-live="polite">
+            <span id="stateLabel">Paused</span>
+            <span><strong id="fpsLabel">0</strong> fps</span>
+            <span>t <strong id="timeLabel">0.0</strong></span>
+          </div>
+        </div>
+
+        <div class="canvas-grid">
+          <figure class="field-panel">
+            <canvas id="fieldCanvas" width="768" height="768"></canvas>
+            <figcaption>Field</figcaption>
+          </figure>
+          <div class="side-views">
+            <figure>
+              <canvas id="growthCanvas" width="256" height="256"></canvas>
+              <figcaption>Growth</figcaption>
+            </figure>
+            <figure>
+              <canvas id="kernelCanvas" width="256" height="256"></canvas>
+              <figcaption>Kernel</figcaption>
+            </figure>
+            <figure>
+              <canvas id="traceCanvas" width="256" height="128"></canvas>
+              <figcaption>Mass</figcaption>
+            </figure>
+          </div>
+        </div>
+      </section>
+
+      <aside class="controls" aria-label="Playground controls">
+        <div class="toolbar">
+          <button id="runBtn" class="primary" title="Run or pause" aria-label="Run or pause">▶</button>
+          <button id="stepBtn" title="Step once" aria-label="Step once">↦</button>
+          <button id="resetBtn" title="Reset preset" aria-label="Reset preset">↺</button>
+          <button id="clearBtn" title="Clear field" aria-label="Clear field">⌫</button>
+          <button id="randomBtn" title="Randomize field" aria-label="Randomize field">✦</button>
+        </div>
+
+        <label class="control-block">
+          <span>Preset</span>
+          <select id="presetSelect"></select>
+        </label>
+
+        <div class="segmented" role="group" aria-label="Brush mode">
+          <button id="paintBtn" class="active" title="Paint cells" aria-label="Paint cells">●</button>
+          <button id="eraseBtn" title="Erase cells" aria-label="Erase cells">○</button>
+          <button id="sampleBtn" title="Sample value" aria-label="Sample value">⌖</button>
+        </div>
+
+        <label class="control-block">
+          <span>Brush <strong id="brushValue">7</strong></span>
+          <input id="brushSlider" type="range" min="1" max="18" value="7" />
+        </label>
+
+        <label class="control-block">
+          <span>Brush power <strong id="brushPowerValue">0.25</strong></span>
+          <input id="brushPowerSlider" type="range" min="0.05" max="1.00" step="0.05" value="0.25" />
+        </label>
+
+        <label class="control-block">
+          <span>Resolution</span>
+          <select id="sizeSelect">
+            <option value="64" selected>64 x 64</option>
+            <option value="96">96 x 96</option>
+            <option value="128">128 x 128</option>
+          </select>
+        </label>
+
+        <label class="control-block">
+          <span>Kernel radius <strong id="radiusValue">10</strong></span>
+          <input id="radiusSlider" type="range" min="2" max="40" value="10" />
+        </label>
+
+        <label class="control-block">
+          <span>Kernel sharpness <strong id="alphaValue">4.0</strong></span>
+          <input id="alphaSlider" type="range" min="1" max="12" step="0.5" value="4" />
+        </label>
+
+        <label class="control-block">
+          <span>Growth center μ <strong id="muValue">0.150</strong></span>
+          <input id="muSlider" type="range" min="0.050" max="0.450" step="0.001" value="0.070" />
+        </label>
+
+        <label class="control-block">
+          <span>Growth width σ <strong id="sigmaValue">0.015</strong></span>
+          <input id="sigmaSlider" type="range" min="0.006" max="0.090" step="0.001" value="0.035" />
+        </label>
+
+        <label class="control-block">
+          <span>Time step <strong id="dtValue">0.100</strong></span>
+          <input id="dtSlider" type="range" min="0.001" max="1.000" step="0.001" value="0.100" />
+        </label>
+
+        <label class="control-block">
+          <span>Growth gain <strong id="gainValue">1.00</strong></span>
+          <input id="gainSlider" type="range" min="0.10" max="2.50" step="0.05" value="1" />
+        </label>
+
+        <label class="control-block">
+          <span>Decay <strong id="decayValue">0.000</strong></span>
+          <input id="decaySlider" type="range" min="0.000" max="0.030" step="0.001" value="0" />
+        </label>
+
+        <label class="control-block">
+          <span>FPS cap <strong id="fpsCapValue">60</strong></span>
+          <input id="fpsCapSlider" type="range" min="10" max="120" step="5" value="60" />
+        </label>
+
+        <label class="control-block">
+          <span>Steps/frame <strong id="stepsValue">1</strong></span>
+          <input id="stepsSlider" type="range" min="1" max="6" step="1" value="1" />
+        </label>
+
+        <label class="control-block">
+          <span>Palette</span>
+          <select id="paletteSelect">
+            <option value="aurora" selected>Aurora</option>
+            <option value="ember">Ember</option>
+            <option value="mono">Mono</option>
+          </select>
+        </label>
+
+        <div class="metrics">
+          <div><span>Mass</span><strong id="massLabel">0.000</strong></div>
+          <div><span>Growth</span><strong id="growthLabel">0.000</strong></div>
+          <div><span>Energy</span><strong id="energyLabel">0.000</strong></div>
+          <div><span>Sample</span><strong id="sampleLabel">-</strong></div>
+        </div>
+      </aside>
+    </main>
+  </body>
+</html>

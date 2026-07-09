@@ -1,0 +1,374 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Leniency Range Playground</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="src/range-playground.css" />
+    <script defer src="src/lenia-lifeforms.js"></script>
+    <script defer src="src/compatible-extra-lifeforms.js"></script>
+    <script defer src="src/webgl-sim.js"></script>
+    <script defer src="src/range-playground.js"></script>
+  </head>
+  <body>
+    <canvas id="glFieldCanvas" aria-hidden="true"></canvas>
+    <canvas id="fieldCanvas" aria-label="Lenia field"></canvas>
+    <button id="gameModeBtn" class="game-mode-button" type="button" aria-pressed="false" aria-label="Game Mode" title="Game Mode">
+      Game
+    </button>
+
+    <section class="float-panel time-panel" aria-label="Time controls">
+      <div class="time-status">
+        <span id="stateLabel">Paused</span>
+        <span id="timeLabel">t 0.0</span>
+      </div>
+      <div class="transport-row">
+        <button id="runBtn" class="icon-button primary" type="button" aria-label="Play" title="Play">
+          <img id="runIcon" src="assets/play.png" alt="" />
+          <span class="sr-only">Play</span>
+        </button>
+        <button id="stepBtn" class="icon-button" type="button" aria-label="Step" title="Step">
+          <img src="assets/step.png" alt="" />
+          <span class="sr-only">Step</span>
+        </button>
+        <button id="clearBtn" class="icon-button" type="button" aria-label="Clear" title="Clear">
+          <img src="assets/clear.png" alt="" />
+          <span class="sr-only">Clear</span>
+        </button>
+        <button id="randomBtn" class="icon-button" type="button" aria-label="Random" title="Random">
+          <img src="assets/random.png" alt="" />
+          <span class="sr-only">Random</span>
+        </button>
+      </div>
+    </section>
+
+    <div class="left-panel-stack">
+      <section class="float-panel config-panel" aria-label="Simulation controls">
+        <header class="panel-head">
+          <div>
+            <h1>Playground</h1>
+          </div>
+        </header>
+
+        <div class="tabs" role="tablist" aria-label="Config tabs">
+          <button id="timeTabBtn" class="active" type="button">Time</button>
+          <button id="gameTabBtn" type="button">Game</button>
+          <button id="advancedTabBtn" type="button">Advanced</button>
+        </div>
+
+      <div id="timeTab" class="tab-page active">
+        <label class="control">
+          <span>Simulation speed <strong id="speedValue">12</strong></span>
+          <input id="speedSlider" type="range" min="1" max="60" step="1" value="12" />
+        </label>
+
+        <div class="metrics">
+          <div><span>Backend</span><strong id="backendLabel">CPU</strong></div>
+          <div><span>Mass</span><strong id="massLabel">0.0000</strong></div>
+          <div><span>Growth</span><strong id="growthLabel">0.0000</strong></div>
+          <div><span>Energy</span><strong id="energyLabel">0.0000</strong></div>
+          <div><span>Render FPS</span><strong id="fpsLabel">0</strong></div>
+          <div><span>Sim/s</span><strong id="simFpsLabel">0</strong></div>
+          <div><span>Step sim</span><strong id="simMsLabel">0.0</strong></div>
+          <div><span>Colorize</span><strong id="colorizeMsLabel">0.0</strong></div>
+          <div><span>Buffer</span><strong id="bufferMsLabel">0.0</strong></div>
+          <div><span>Render</span><strong id="renderMsLabel">0.0</strong></div>
+          <div><span>Chunks</span><strong id="chunkLabel">0/0</strong></div>
+          <div><span>Patches</span><strong id="patchLabel">0</strong></div>
+        </div>
+      </div>
+
+      <div id="gameTab" class="tab-page">
+        <label class="control">
+          <span>Background</span>
+          <select id="gameBackgroundSelect">
+            <option value="stars" selected>Stars</option>
+            <option value="none">None</option>
+          </select>
+        </label>
+
+        <label class="control">
+          <span>Star density <strong id="gameStarDensityValue">55</strong></span>
+          <input id="gameStarDensitySlider" type="range" min="0" max="100" step="5" value="55" />
+        </label>
+
+        <label class="control">
+          <span>Star speed <strong id="gameStarSpeedValue">1.0</strong></span>
+          <input id="gameStarSpeedSlider" type="range" min="0.0" max="3.0" step="0.1" value="1.0" />
+        </label>
+
+        <label class="control">
+          <span>Star brightness <strong id="gameStarBrightnessValue">0.60</strong></span>
+          <input id="gameStarBrightnessSlider" type="range" min="0.05" max="1.00" step="0.05" value="0.60" />
+        </label>
+
+        <label class="control">
+          <span>Controller acceleration <strong id="gameAccelValue">175</strong></span>
+          <input id="gameAccelSlider" type="range" min="40" max="520" step="5" value="175" />
+        </label>
+
+        <label class="control">
+          <span>Controller max speed <strong id="gameSpeedValue">36</strong></span>
+          <input id="gameSpeedSlider" type="range" min="12" max="220" step="2" value="36" />
+        </label>
+
+        <label class="control">
+          <span>Controller friction <strong id="gameFrictionValue">3.2</strong></span>
+          <input id="gameFrictionSlider" type="range" min="0.5" max="12.0" step="0.1" value="3.2" />
+        </label>
+
+        <label class="control">
+          <span>Mouse sensitivity <strong id="gameMouseSensitivityValue">0.025</strong></span>
+          <input id="gameMouseSensitivitySlider" type="range" min="0.001" max="0.200" step="0.001" value="0.025" />
+        </label>
+
+        <label class="control">
+          <span>Paint cadence <strong id="gameBrushIntervalValue">30</strong> ms</span>
+          <input id="gameBrushIntervalSlider" type="range" min="10" max="120" step="5" value="30" />
+        </label>
+
+        <label class="control">
+          <span>Camera center pull <strong id="gameCameraCenterPullValue">0.35</strong></span>
+          <input id="gameCameraCenterPullSlider" type="range" min="0.00" max="2.00" step="0.05" value="0.35" />
+        </label>
+
+        <label class="control">
+          <span>Camera edge pull <strong id="gameCameraEdgePullValue">5.20</strong></span>
+          <input id="gameCameraEdgePullSlider" type="range" min="0.50" max="14.00" step="0.10" value="5.20" />
+        </label>
+
+        <label class="control">
+          <span>Camera inner zone <strong id="gameCameraInnerZoneValue">28</strong>%</span>
+          <input id="gameCameraInnerZoneSlider" type="range" min="0" max="75" step="1" value="28" />
+        </label>
+
+        <label class="control">
+          <span>Camera edge zone <strong id="gameCameraEdgeZoneValue">86</strong>%</span>
+          <input id="gameCameraEdgeZoneSlider" type="range" min="30" max="98" step="1" value="86" />
+        </label>
+
+        <label class="control">
+          <span>Camera guard zone <strong id="gameCameraGuardZoneValue">94</strong>%</span>
+          <input id="gameCameraGuardZoneSlider" type="range" min="60" max="99" step="1" value="94" />
+        </label>
+
+        <label class="control">
+          <span>Game zoom <strong id="gameZoomValue">18.0</strong></span>
+          <input id="gameZoomSlider" type="range" min="6.0" max="36.0" step="0.5" value="18.0" />
+        </label>
+
+        <label class="control">
+          <span>Minimum zoom <strong id="gameMinZoomValue">6.0</strong></span>
+          <input id="gameMinZoomSlider" type="range" min="2.0" max="32.0" step="0.5" value="6.0" />
+        </label>
+
+        <label class="control">
+          <span>Maximum zoom <strong id="gameMaxZoomValue">36.0</strong></span>
+          <input id="gameMaxZoomSlider" type="range" min="6.0" max="64.0" step="0.5" value="36.0" />
+        </label>
+      </div>
+
+      <div id="advancedTab" class="tab-page">
+        <label class="control">
+          <span>Field size</span>
+          <select id="worldSizeSelect">
+            <option value="64">64 x 64</option>
+            <option value="96">96 x 96</option>
+            <option value="128" selected>128 x 128</option>
+            <option value="256">256 x 256</option>
+            <option value="512">512 x 512</option>
+            <option value="768">768 x 768</option>
+            <option value="1024">1024 x 1024</option>
+          </select>
+        </label>
+
+        <label class="control">
+          <span>Simulation backend</span>
+          <select id="backendSelect">
+            <option value="auto" selected>Auto</option>
+            <option value="webgl">WebGL</option>
+            <option value="cpu">CPU</option>
+          </select>
+        </label>
+
+        <label class="control">
+          <span>Kernel radius <strong id="radiusValue">13</strong></span>
+          <input id="radiusSlider" type="range" min="1" max="36" step="1" value="13" />
+        </label>
+
+        <label class="control">
+          <span>Kernel sharpness <strong id="alphaValue">4.0</strong></span>
+          <input id="alphaSlider" type="range" min="1" max="12" step="0.5" value="4" />
+        </label>
+
+        <label class="control">
+          <span>Growth center mu <strong id="muValue">0.150</strong></span>
+          <input id="muSlider" type="range" min="0.050" max="0.550" step="0.001" value="0.150" />
+        </label>
+
+        <label class="control">
+          <span>Growth width sigma <strong id="sigmaValue">0.017</strong></span>
+          <input id="sigmaSlider" type="range" min="0.006" max="0.120" step="0.001" value="0.017" />
+        </label>
+
+        <label class="control">
+          <span>Time step <strong id="dtValue">0.100</strong></span>
+          <input id="dtSlider" type="range" min="0.001" max="1.000" step="0.001" value="0.100" />
+        </label>
+
+        <label class="control">
+          <span>Growth gain <strong id="gainValue">1.00</strong></span>
+          <input id="gainSlider" type="range" min="0.10" max="2.50" step="0.05" value="1" />
+        </label>
+
+        <label class="control">
+          <span>Decay <strong id="decayValue">0.000</strong></span>
+          <input id="decaySlider" type="range" min="0.000" max="0.030" step="0.001" value="0" />
+        </label>
+
+        <label class="control">
+          <span>Safe area <strong id="safeValue">64</strong></span>
+          <input id="safeSlider" type="range" min="16" max="192" step="8" value="64" />
+        </label>
+
+        <label class="check-row">
+          <input id="limitToggle" type="checkbox" checked />
+          <span>Clamp values</span>
+        </label>
+
+        <label class="check-row">
+          <input id="wrapToggle" type="checkbox" checked />
+          <span>Wrap edges</span>
+        </label>
+
+        <div class="color-editor" aria-label="Color gradient">
+          <label><span>0</span><input id="color0" type="color" value="#080618" /></label>
+          <label><span>1</span><input id="color1" type="color" value="#231c49" /></label>
+          <label><span>2</span><input id="color2" type="color" value="#3e3f77" /></label>
+          <label><span>3</span><input id="color3" type="color" value="#8889bc" /></label>
+          <label><span>4</span><input id="color4" type="color" value="#f0efd6" /></label>
+        </div>
+
+        <button id="resetAdvancedBtn" type="button">Reset Advanced</button>
+      </div>
+      </section>
+
+      <section class="float-panel layer-panel" aria-label="Layers">
+        <header class="panel-head compact">
+          <div>
+            <h2>Layers</h2>
+          </div>
+          <div class="panel-actions">
+            <button id="addLayerBtn" type="button" aria-label="Add layer" title="Add layer">+</button>
+            <button id="removeLayerBtn" type="button" aria-label="Remove layer" title="Remove layer">-</button>
+          </div>
+        </header>
+
+        <div id="layerList" class="layer-list"></div>
+
+        <div class="layer-editor">
+          <label class="control">
+            <span>Name</span>
+            <input id="layerNameInput" type="text" maxlength="36" value="Layer 1" />
+          </label>
+
+          <label class="check-row">
+            <input id="layerVisibleToggle" type="checkbox" checked />
+            <span>Visible</span>
+          </label>
+
+          <label class="control">
+            <span>Rule reads</span>
+            <select id="layerSourceSelect"></select>
+          </label>
+
+          <div class="layer-destination">Writes <strong id="layerDestinationLabel">Layer 1</strong></div>
+
+          <label class="control">
+            <span>Metrics</span>
+            <select id="metricScopeSelect">
+              <option value="selected" selected>Selected layer</option>
+              <option value="aggregate">Aggregate</option>
+            </select>
+          </label>
+
+          <div class="color-editor layer-colors" aria-label="Layer color gradient">
+            <label><span>0</span><input id="layerColor0" type="color" value="#080618" /></label>
+            <label><span>1</span><input id="layerColor1" type="color" value="#231c49" /></label>
+            <label><span>2</span><input id="layerColor2" type="color" value="#3e3f77" /></label>
+            <label><span>3</span><input id="layerColor3" type="color" value="#8889bc" /></label>
+            <label><span>4</span><input id="layerColor4" type="color" value="#f0efd6" /></label>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <section class="float-panel library-panel" aria-label="Lifeform selector">
+      <header class="panel-head">
+        <div>
+          <h2>Lifeforms</h2>
+          <span id="libraryCount">0 forms</span>
+        </div>
+      </header>
+
+      <div class="tool-row" role="group" aria-label="Tool">
+        <button id="panToolBtn" type="button">Pan</button>
+        <button id="lifeToolBtn" class="active" type="button">Form</button>
+        <button id="paintToolBtn" type="button">Brush</button>
+        <button id="eraseToolBtn" type="button">Erase</button>
+        <button id="sampleToolBtn" type="button">Sample</button>
+        <button id="saveMapBtn" type="button" aria-label="Save Map" title="Save Map">Save</button>
+        <button id="loadMapBtn" type="button" aria-label="Load Map" title="Load Map">Load</button>
+        <input id="loadMapInput" type="file" accept=".map,application/json" hidden />
+      </div>
+
+      <label class="control">
+        <span>Brush size <strong id="brushSizeValue">3</strong></span>
+        <input id="brushSizeSlider" type="range" min="1" max="48" step="1" value="3" />
+      </label>
+
+      <label class="control">
+        <span>Brush power <strong id="brushPowerValue">0.15</strong></span>
+        <input id="brushPowerSlider" type="range" min="0.05" max="1.00" step="0.05" value="0.15" />
+      </label>
+
+      <input id="formSearch" class="search" type="search" placeholder="Search" />
+      <div class="group-organizer" aria-label="Compatible groups">
+        <div class="group-nav">
+          <button id="prevGroupBtn" type="button" title="Previous group" aria-label="Previous group">&lt;</button>
+          <select id="groupSelect" aria-label="Compatible group"></select>
+          <button id="nextGroupBtn" type="button" title="Next group" aria-label="Next group">&gt;</button>
+        </div>
+        <div id="groupRule" class="group-rule">No group selected</div>
+      </div>
+      <div id="selectedForm" class="selected-form">No form selected</div>
+      <div id="formList" class="form-list"></div>
+      <div class="sample-readout">Sample <strong id="sampleLabel">-</strong></div>
+    </section>
+
+    <div id="groupChangeDialog" class="modal-backdrop" hidden>
+      <section class="modal" role="alertdialog" aria-modal="true" aria-labelledby="groupChangeTitle">
+        <h2 id="groupChangeTitle">Change Field Values</h2>
+        <p id="groupChangeMessage">Changing group updates the field's simulation values.</p>
+        <label class="check-row">
+          <input id="skipGroupAlert" type="checkbox" />
+          <span>Don't show again</span>
+        </label>
+        <div class="modal-actions">
+          <button id="cancelGroupChangeBtn" type="button">Cancel</button>
+          <button id="confirmGroupChangeBtn" class="primary" type="button">Change Group</button>
+        </div>
+      </section>
+    </div>
+
+    <div id="placementControls" class="placement-controls" hidden>
+      <button id="scaleDownBtn" type="button">-</button>
+      <button id="rotateLeftBtn" type="button">L</button>
+      <button id="commitPlacementBtn" class="primary" type="button">Play</button>
+      <button id="rotateRightBtn" type="button">R</button>
+      <button id="scaleUpBtn" type="button">+</button>
+      <button id="cancelPlacementBtn" type="button">X</button>
+    </div>
+  </body>
+</html>

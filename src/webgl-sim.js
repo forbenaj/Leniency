@@ -1,0 +1,1143 @@
+(function () {
+  const EPSILON = 0.00001;
+  const MAX_RENDER_CHANNELS = 8;
+  const DEFAULT_COLORS = ["#080618", "#231c49", "#3e3f77", "#8889bc", "#f0efd6"];
+  const DEFAULT_RULE = {
+    id: "rule-0",
+    sourceChannelId: "channel-0",
+    destinationChannelId: "channel-0",
+    radius: 13,
+    alpha: 4,
+    mu: 0.15,
+    sigma: 0.017,
+    dt: 0.1,
+    gain: 1,
+    decay: 0,
+    limitValue: true,
+    wrapAround: true,
+    deltaName: "gaus",
+    coreName: "bump4",
+    layer: 0,
+    beta: [1, 0, 0, 0],
+    eta: [0, 0, 0, 0],
+  };
+
+  class WebGLLeniaSim {
+    constructor(canvas) {
+      this.canvas = canvas;
+      this.gl = canvas.getContext("webgl2", {
+        alpha: false,
+        antialias: false,
+        depth: false,
+        stencil: false,
+        preserveDrawingBuffer: false,
+      });
+      if (!this.gl) throw new Error("WebGL2 is unavailable");
+
+      const gl = this.gl;
+      this.floatColorExt = gl.getExtension("EXT_color_buffer_float");
+      if (!this.floatColorExt) throw new Error("EXT_color_buffer_float is unavailable");
+
+      this.width = 1;
+      this.height = 1;
+      this.channels = [];
+      this.channelMap = new Map();
+      this.rules = [];
+      this.wrapAround = true;
+      this.selectedChannelId = "channel-0";
+      this.metricScope = "selected";
+      this.metrics = emptyMetrics(this.selectedChannelId, this.metricScope);
+      this.lastMetricReadAt = 0;
+      this.profile = {
+        stepSimulationMs: 0,
+        colorizeMs: 0,
+        updateFieldBufferMs: 0,
+        activeChunks: 0,
+        simChunks: 0,
+        patches: 0,
+      };
+
+      this.vao = gl.createVertexArray();
+      gl.bindVertexArray(this.vao);
+      this.stepProgram = createProgram(gl, VERTEX_SHADER, STEP_FRAGMENT_SHADER);
+      this.renderProgram = createProgram(gl, VERTEX_SHADER, RENDER_FRAGMENT_SHADER);
+      this.brushProgram = createProgram(gl, VERTEX_SHADER, BRUSH_FRAGMENT_SHADER);
+      this.placeProgram = createProgram(gl, VERTEX_SHADER, PLACE_FRAGMENT_SHADER);
+      this.copyProgram = createProgram(gl, VERTEX_SHADER, COPY_FRAGMENT_SHADER);
+      this.clearProgram = createProgram(gl, VERTEX_SHADER, CLEAR_FRAGMENT_SHADER);
+      this.quantizeProgram = createProgram(gl, VERTEX_SHADER, QUANTIZE_FRAGMENT_SHADER);
+      this.emptyTexture = null;
+      this.testFloatFramebuffer();
+      this.emptyTexture = this.createFieldTexture(1, 1);
+    }
+
+    static isSupported(canvas) {
+      try {
+        const sim = new WebGLLeniaSim(canvas);
+        sim.dispose();
+        return { supported: true, reason: "" };
+      } catch (error) {
+        return { supported: false, reason: String(error?.message || error) };
+      }
+    }
+
+    init(width, height, modelOrConfig, colors) {
+      this.width = Math.max(1, Math.floor(width || 1));
+      this.height = Math.max(1, Math.floor(height || 1));
+      this.setModel(modelOrConfig?.channels ? modelOrConfig : legacyModel(modelOrConfig, colors), { preserve: false });
+      this.clear();
+    }
+
+    dispose() {
+      const gl = this.gl;
+      for (const channel of this.channels) deleteChannel(gl, channel);
+      for (const rule of this.rules) {
+        if (rule.kernelTexture) gl.deleteTexture(rule.kernelTexture);
+      }
+      if (this.emptyTexture) gl.deleteTexture(this.emptyTexture);
+      for (const program of [
+        this.stepProgram,
+        this.renderProgram,
+        this.brushProgram,
+        this.placeProgram,
+        this.copyProgram,
+        this.clearProgram,
+        this.quantizeProgram,
+      ]) {
+        if (program) gl.deleteProgram(program);
+      }
+      if (this.vao) gl.deleteVertexArray(this.vao);
+    }
+
+    setConfig(config) {
+      const model = currentModel(this);
+      const selectedRule = model.rules.find((rule) => rule.destinationChannelId === this.selectedChannelId) || model.rules[0];
+      if (selectedRule) Object.assign(selectedRule, config || {});
+      model.wrapAround = config?.wrapAround !== false;
+      this.setModel(model);
+    }
+
+    setModel(model, { preserve = true } = {}) {
+      const normalized = normalizeModel(model);
+      const gl = this.gl;
+      const previous = this.channelMap;
+      const nextChannels = [];
+      const nextMap = new Map();
+
+      for (const info of normalized.channels) {
+        let channel = preserve ? previous.get(info.id) : null;
+        if (!channel) channel = this.createChannel(info);
+        channel.id = info.id;
+        channel.name = info.name;
+        channel.visible = info.visible;
+        channel.palette = info.palette;
+        nextChannels.push(channel);
+        nextMap.set(channel.id, channel);
+      }
+
+      for (const oldChannel of this.channels) {
+        if (!nextMap.has(oldChannel.id)) deleteChannel(gl, oldChannel);
+      }
+      for (const rule of this.rules) {
+        if (rule.kernelTexture) gl.deleteTexture(rule.kernelTexture);
+      }
+
+      this.channels = nextChannels;
+      this.channelMap = nextMap;
+      this.selectedChannelId = nextMap.has(normalized.selectedChannelId) ? normalized.selectedChannelId : this.channels[0]?.id || "channel-0";
+      this.metricScope = normalized.metricScope;
+      this.wrapAround = normalized.wrapAround;
+      this.rules = normalized.rules.filter(
+        (rule) => nextMap.has(rule.sourceChannelId) && nextMap.has(rule.destinationChannelId),
+      );
+      if (!this.rules.length && this.channels.length) {
+        this.rules = [normalizeRule({ sourceChannelId: this.channels[0].id, destinationChannelId: this.channels[0].id })];
+      }
+      for (const rule of this.rules) this.rebuildKernel(rule);
+      for (const channel of this.channels) {
+        if (isDiscreteChannel(this.rules, channel.id)) this.quantizeChannel(channel);
+      }
+      this.markFullSimulation();
+    }
+
+    setPalette(colors) {
+      const channel = this.channels[0];
+      if (!channel) return;
+      channel.palette = colors && colors.length ? colors : DEFAULT_COLORS;
+    }
+
+    resize(width, height) {
+      const oldWidth = this.width;
+      const oldHeight = this.height;
+      this.width = Math.max(1, Math.floor(width || 1));
+      this.height = Math.max(1, Math.floor(height || 1));
+      const gl = this.gl;
+
+      for (const channel of this.channels) {
+        const oldTextures = channel.textures;
+        const oldFramebuffers = channel.framebuffers;
+        const oldTexture = sourceTexture(channel);
+        channel.textures = [this.createFieldTexture(this.width, this.height), this.createFieldTexture(this.width, this.height)];
+        channel.framebuffers = channel.textures.map((texture) => this.createFramebuffer(texture));
+        channel.sourceIndex = 0;
+
+        const copyWidth = Math.min(oldWidth, this.width);
+        const copyHeight = Math.min(oldHeight, this.height);
+        const oldX = Math.floor((oldWidth - copyWidth) / 2);
+        const oldY = Math.floor((oldHeight - copyHeight) / 2);
+        const newX = Math.floor((this.width - copyWidth) / 2);
+        const newY = Math.floor((this.height - copyHeight) / 2);
+        this.runCopyPass(channel, oldTexture, oldWidth, oldHeight, oldX, oldY, newX, newY, copyWidth, copyHeight);
+        this.clearTexture(channel.textures[1], channel.framebuffers[1]);
+
+        for (const texture of oldTextures) gl.deleteTexture(texture);
+        for (const framebuffer of oldFramebuffers) gl.deleteFramebuffer(framebuffer);
+      }
+      for (const rule of this.rules) this.rebuildKernel(rule);
+      this.metrics = emptyMetrics(this.selectedChannelId, this.metricScope);
+      this.markFullSimulation();
+    }
+
+    clear(channelId = null) {
+      for (const channel of this.channels) {
+        if (channelId && channel.id !== channelId) continue;
+        this.clearTexture(channel.textures[0], channel.framebuffers[0]);
+        this.clearTexture(channel.textures[1], channel.framebuffers[1]);
+        channel.sourceIndex = 0;
+      }
+      this.metrics = emptyMetrics(this.selectedChannelId, this.metricScope);
+      this.profile = { ...this.profile, activeChunks: 0, simChunks: 0, patches: 0 };
+    }
+
+    randomize(rect, channelId = this.selectedChannelId) {
+      const channel = this.channelMap.get(channelId) || this.channelMap.get(this.selectedChannelId) || this.channels[0];
+      if (!channel) return;
+      const data = new Float32Array(this.width * this.height);
+      const safeRect = normalizeRect(rect, this.width, this.height);
+      const discrete = isDiscreteChannel(this.rules, channel.id);
+      for (let y = safeRect.top; y < safeRect.bottom; y += 1) {
+        const row = y * this.width;
+        for (let x = safeRect.left; x < safeRect.right; x += 1) {
+          if (Math.random() > 0.86) data[row + x] = discrete ? 1 : Math.random();
+        }
+      }
+      const gl = this.gl;
+      gl.bindTexture(gl.TEXTURE_2D, sourceTexture(channel));
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, this.width, this.height, gl.RED, gl.FLOAT, data);
+      this.clearTexture(destinationTexture(channel), destinationFramebuffer(channel));
+      this.markFullSimulation();
+    }
+
+    brush({ x, y, radius, power, mode, channelId }) {
+      const channel = this.channelMap.get(channelId) || this.channelMap.get(this.selectedChannelId) || this.channels[0];
+      if (!channel) return;
+      this.runEditProgram(channel, this.brushProgram, (gl, program) => {
+        bindTexture(gl, program, "uField", sourceTexture(channel), 0);
+        gl.uniform2f(gl.getUniformLocation(program, "uWorldSize"), this.width, this.height);
+        gl.uniform2f(gl.getUniformLocation(program, "uCenter"), x, y);
+        gl.uniform1f(gl.getUniformLocation(program, "uRadius"), Math.max(0, radius ?? 0));
+        gl.uniform1f(gl.getUniformLocation(program, "uPower"), Math.max(0, power || 0));
+        gl.uniform1i(gl.getUniformLocation(program, "uMode"), mode === "erase" ? 1 : 0);
+        gl.uniform1i(gl.getUniformLocation(program, "uWrap"), this.wrapAround ? 1 : 0);
+        gl.uniform1i(gl.getUniformLocation(program, "uDiscrete"), isDiscreteChannel(this.rules, channel.id) ? 1 : 0);
+      });
+      this.markFullSimulation();
+    }
+
+    place(placement) {
+      if (!placement || !placement.cells || !placement.width || !placement.height) return;
+      const channel =
+        this.channelMap.get(placement.channelId) || this.channelMap.get(this.selectedChannelId) || this.channels[0];
+      if (!channel) return;
+      const gl = this.gl;
+      const cellTexture = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, cellTexture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, placement.width, placement.height, 0, gl.RED, gl.FLOAT, placement.cells);
+
+      this.runEditProgram(channel, this.placeProgram, (nextGl, program) => {
+        bindTexture(nextGl, program, "uField", sourceTexture(channel), 0);
+        bindTexture(nextGl, program, "uCells", cellTexture, 1);
+        nextGl.uniform2f(nextGl.getUniformLocation(program, "uWorldSize"), this.width, this.height);
+        nextGl.uniform2f(nextGl.getUniformLocation(program, "uCenter"), placement.x, placement.y);
+        nextGl.uniform2f(nextGl.getUniformLocation(program, "uCellSize"), placement.width, placement.height);
+        nextGl.uniform1f(nextGl.getUniformLocation(program, "uScale"), placement.scale || 1);
+        nextGl.uniform1f(nextGl.getUniformLocation(program, "uAngle"), placement.angle || 0);
+        nextGl.uniform1i(nextGl.getUniformLocation(program, "uWrap"), this.wrapAround ? 1 : 0);
+        nextGl.uniform1i(nextGl.getUniformLocation(program, "uDiscrete"), isDiscreteChannel(this.rules, channel.id) ? 1 : 0);
+      });
+      gl.deleteTexture(cellTexture);
+      this.markFullSimulation();
+    }
+
+    sample(x, y, channelId = this.selectedChannelId, scope = this.metricScope) {
+      if (x < 0 || y < 0 || x >= this.width || y >= this.height) return 0;
+      if (scope === "aggregate") {
+        let total = 0;
+        for (const channel of this.channels) total += this.readPixel(channel, x, y);
+        return clamp(total);
+      }
+      const channel = this.channelMap.get(channelId) || this.channelMap.get(this.selectedChannelId) || this.channels[0];
+      return channel ? this.readPixel(channel, x, y) : 0;
+    }
+
+    snapshot() {
+      const channels = this.channels.map((channel) => ({
+        id: channel.id,
+        name: channel.name,
+        visible: channel.visible,
+        palette: [...channel.palette],
+        width: this.width,
+        height: this.height,
+        values: this.readChannel(channel),
+      }));
+      return {
+        width: this.width,
+        height: this.height,
+        channels,
+        values: channels[0]?.values || new Float32Array(this.width * this.height),
+      };
+    }
+
+    loadSnapshot(snapshot = {}) {
+      if (snapshot.width && snapshot.height && (snapshot.width !== this.width || snapshot.height !== this.height)) {
+        this.width = Math.max(1, Math.floor(snapshot.width));
+        this.height = Math.max(1, Math.floor(snapshot.height));
+        this.setModel(snapshot.model || currentModel(this), { preserve: false });
+      } else if (snapshot.model) {
+        this.setModel(snapshot.model);
+      }
+      const incoming = Array.isArray(snapshot.channels)
+        ? snapshot.channels
+        : [{ id: this.channels[0]?.id || "channel-0", values: snapshot.values }];
+      for (const item of incoming) {
+        const channel = this.channelMap.get(item.id) || this.channels[0];
+        if (!channel || !item.values) continue;
+        const values = item.values instanceof Float32Array ? item.values : new Float32Array(item.values);
+        if (values.length !== this.width * this.height) continue;
+        const gl = this.gl;
+        gl.bindTexture(gl.TEXTURE_2D, sourceTexture(channel));
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, this.width, this.height, gl.RED, gl.FLOAT, values);
+        this.clearTexture(destinationTexture(channel), destinationFramebuffer(channel));
+      }
+      this.markFullSimulation();
+    }
+
+    step(count) {
+      const gl = this.gl;
+      const stepCount = Math.max(1, Math.min(8, count || 1));
+      const start = performance.now();
+      for (let i = 0; i < stepCount; i += 1) {
+        for (const rule of this.rules) {
+          const source = this.channelMap.get(rule.sourceChannelId);
+          const dest = this.channelMap.get(rule.destinationChannelId);
+          if (!source || !dest) continue;
+          gl.useProgram(this.stepProgram);
+          gl.bindFramebuffer(gl.FRAMEBUFFER, destinationFramebuffer(dest));
+          gl.viewport(0, 0, this.width, this.height);
+          bindTexture(gl, this.stepProgram, "uSourceField", sourceTexture(source), 0);
+          bindTexture(gl, this.stepProgram, "uDestField", sourceTexture(dest), 1);
+          bindTexture(gl, this.stepProgram, "uKernel", rule.kernelTexture, 2);
+          gl.uniform2f(gl.getUniformLocation(this.stepProgram, "uWorldSize"), this.width, this.height);
+          gl.uniform1i(gl.getUniformLocation(this.stepProgram, "uKernelCount"), rule.kernelCount);
+          gl.uniform1f(gl.getUniformLocation(this.stepProgram, "uMu"), rule.mu);
+          gl.uniform1f(gl.getUniformLocation(this.stepProgram, "uSigma"), rule.sigma);
+          gl.uniform1f(gl.getUniformLocation(this.stepProgram, "uDt"), rule.dt);
+          gl.uniform1f(gl.getUniformLocation(this.stepProgram, "uGain"), rule.gain);
+          gl.uniform1f(gl.getUniformLocation(this.stepProgram, "uDecay"), rule.decay);
+          gl.uniform1f(gl.getUniformLocation(this.stepProgram, "uAlpha"), rule.alpha);
+          gl.uniform1i(gl.getUniformLocation(this.stepProgram, "uLimit"), rule.limitValue ? 1 : 0);
+          gl.uniform1i(gl.getUniformLocation(this.stepProgram, "uWrap"), this.wrapAround ? 1 : 0);
+          gl.uniform1i(gl.getUniformLocation(this.stepProgram, "uDeltaMode"), deltaMode(rule.deltaName));
+          gl.uniform1i(gl.getUniformLocation(this.stepProgram, "uDiscrete"), isDiscreteRule(rule) ? 1 : 0);
+          gl.drawArrays(gl.TRIANGLES, 0, 3);
+          swap(dest);
+        }
+      }
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.flush();
+      const stepMs = performance.now() - start;
+      this.markFullSimulation();
+      this.profile.stepSimulationMs = stepMs;
+      return {
+        stepSimulationMs: stepMs,
+        steps: stepCount,
+        activeChunks: this.profile.activeChunks,
+        simChunks: this.profile.simChunks,
+      };
+    }
+
+    readMetrics(now = performance.now(), force = false) {
+      if (!force && now - this.lastMetricReadAt < 850) return null;
+      this.lastMetricReadAt = now;
+      const perChannel = {};
+      let aggregateMass = 0;
+      let aggregateEnergy = 0;
+      for (const channel of this.channels) {
+        const values = this.readChannel(channel);
+        let mass = 0;
+        let energy = 0;
+        for (let i = 0; i < values.length; i += 1) {
+          const value = values[i];
+          if (value > EPSILON) mass += value;
+          energy += value * value;
+        }
+        const channelMetrics = {
+          mass: mass / values.length,
+          growth: this.metrics.perChannel?.[channel.id]?.growth || 0,
+          energy: energy / values.length,
+        };
+        perChannel[channel.id] = channelMetrics;
+        aggregateMass += channelMetrics.mass;
+        aggregateEnergy += channelMetrics.energy;
+      }
+      const aggregate = {
+        mass: aggregateMass,
+        growth: Object.values(perChannel).reduce((sum, item) => sum + item.growth, 0),
+        energy: aggregateEnergy,
+      };
+      this.metrics = {
+        selectedChannelId: this.selectedChannelId,
+        scope: this.metricScope,
+        perChannel,
+        aggregate,
+        ...(this.metricScope === "aggregate" ? aggregate : perChannel[this.selectedChannelId] || aggregate),
+      };
+      return this.metrics;
+    }
+
+    render({ cssWidth, cssHeight, dpr, camera, background }) {
+      const gl = this.gl;
+      const pixelWidth = Math.max(1, Math.round(cssWidth * dpr));
+      const pixelHeight = Math.max(1, Math.round(cssHeight * dpr));
+      if (this.canvas.width !== pixelWidth) this.canvas.width = pixelWidth;
+      if (this.canvas.height !== pixelHeight) this.canvas.height = pixelHeight;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, pixelWidth, pixelHeight);
+      gl.useProgram(this.renderProgram);
+
+      const renderChannels = this.channels.slice(0, MAX_RENDER_CHANNELS);
+      for (let i = 0; i < MAX_RENDER_CHANNELS; i += 1) {
+        const channel = renderChannels[i];
+        bindTexture(gl, this.renderProgram, `uField${i}`, channel ? sourceTexture(channel) : this.emptyTexture, i);
+      }
+      gl.uniform2f(gl.getUniformLocation(this.renderProgram, "uWorldSize"), this.width, this.height);
+      gl.uniform2f(gl.getUniformLocation(this.renderProgram, "uCssSize"), cssWidth, cssHeight);
+      gl.uniform1f(gl.getUniformLocation(this.renderProgram, "uDpr"), dpr);
+      gl.uniform3f(gl.getUniformLocation(this.renderProgram, "uCamera"), camera.x, camera.y, camera.scale);
+      gl.uniform1i(gl.getUniformLocation(this.renderProgram, "uWrap"), this.wrapAround ? 1 : 0);
+      gl.uniform1i(gl.getUniformLocation(this.renderProgram, "uChannelCount"), renderChannels.length);
+      gl.uniform1iv(gl.getUniformLocation(this.renderProgram, "uVisible"), visibleArray(renderChannels));
+      gl.uniform1iv(gl.getUniformLocation(this.renderProgram, "uPaletteCount"), paletteCountArray(renderChannels));
+      gl.uniform3fv(gl.getUniformLocation(this.renderProgram, "uPalettes"), flattenPalettes(renderChannels));
+      const bg = hexToRgb(background || this.channels[0]?.palette?.[0] || DEFAULT_COLORS[0]).map((value) => value / 255);
+      gl.uniform3f(gl.getUniformLocation(this.renderProgram, "uBackground"), bg[0], bg[1], bg[2]);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
+
+    createChannel(info) {
+      const textures = [this.createFieldTexture(this.width, this.height), this.createFieldTexture(this.width, this.height)];
+      return {
+        id: info.id,
+        name: info.name,
+        visible: info.visible,
+        palette: info.palette,
+        textures,
+        framebuffers: textures.map((texture) => this.createFramebuffer(texture)),
+        sourceIndex: 0,
+      };
+    }
+
+    createFieldTexture(width, height) {
+      const gl = this.gl;
+      const texture = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, width, height, 0, gl.RED, gl.FLOAT, null);
+      return texture;
+    }
+
+    createFramebuffer(texture) {
+      const gl = this.gl;
+      const framebuffer = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+      const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      if (status !== gl.FRAMEBUFFER_COMPLETE) throw new Error("Float framebuffer is incomplete");
+      return framebuffer;
+    }
+
+    clearTexture(texture, framebuffer) {
+      if (!texture || !framebuffer) return;
+      const gl = this.gl;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+      gl.viewport(0, 0, this.width, this.height);
+      gl.clearBufferfv(gl.COLOR, 0, new Float32Array([0, 0, 0, 0]));
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    }
+
+    testFloatFramebuffer() {
+      const texture = this.createFieldTexture(1, 1);
+      const framebuffer = this.createFramebuffer(texture);
+      this.gl.deleteFramebuffer(framebuffer);
+      this.gl.deleteTexture(texture);
+    }
+
+    rebuildKernel(rule) {
+      const offsets = [];
+      let total = 0;
+      const radius = Math.max(1, Math.round(rule.radius || 1));
+      for (let oy = -radius; oy <= radius; oy += 1) {
+        for (let ox = -radius; ox <= radius; ox += 1) {
+          const distance = Math.hypot(ox, oy);
+          if (distance > radius) continue;
+          const weight = kernelValue(rule, distance / radius);
+          if (weight <= 0) continue;
+          offsets.push({ ox, oy, weight });
+          total += weight;
+        }
+      }
+
+      rule.kernelCount = offsets.length;
+      const gl = this.gl;
+      const maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+      if (rule.kernelCount > maxTextureSize) {
+        throw new Error(`Kernel radius ${radius} needs ${rule.kernelCount} texels, over MAX_TEXTURE_SIZE ${maxTextureSize}`);
+      }
+      const data = new Float32Array(Math.max(1, rule.kernelCount) * 4);
+      for (let i = 0; i < offsets.length; i += 1) {
+        data[i * 4] = offsets[i].ox;
+        data[i * 4 + 1] = offsets[i].oy;
+        data[i * 4 + 2] = total > 0 ? offsets[i].weight / total : 0;
+      }
+      if (!rule.kernelTexture) rule.kernelTexture = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, rule.kernelTexture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, Math.max(1, rule.kernelCount), 1, 0, gl.RGBA, gl.FLOAT, data);
+    }
+
+    runEditProgram(channel, program, setUniforms) {
+      const gl = this.gl;
+      gl.useProgram(program);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, destinationFramebuffer(channel));
+      gl.viewport(0, 0, this.width, this.height);
+      setUniforms(gl, program);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      swap(channel);
+    }
+
+    quantizeChannel(channel) {
+      this.runEditProgram(channel, this.quantizeProgram, (gl, program) => {
+        bindTexture(gl, program, "uField", sourceTexture(channel), 0);
+      });
+      this.markFullSimulation();
+    }
+
+    runCopyPass(channel, oldTexture, oldWidth, oldHeight, oldX, oldY, newX, newY, copyWidth, copyHeight) {
+      const gl = this.gl;
+      gl.useProgram(this.copyProgram);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, sourceFramebuffer(channel));
+      gl.viewport(0, 0, this.width, this.height);
+      bindTexture(gl, this.copyProgram, "uOldField", oldTexture, 0);
+      gl.uniform2f(gl.getUniformLocation(this.copyProgram, "uOldSize"), oldWidth, oldHeight);
+      gl.uniform2f(gl.getUniformLocation(this.copyProgram, "uNewSize"), this.width, this.height);
+      gl.uniform2f(gl.getUniformLocation(this.copyProgram, "uOldOrigin"), oldX, oldY);
+      gl.uniform2f(gl.getUniformLocation(this.copyProgram, "uNewOrigin"), newX, newY);
+      gl.uniform2f(gl.getUniformLocation(this.copyProgram, "uCopySize"), copyWidth, copyHeight);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    }
+
+    readPixel(channel, x, y) {
+      const gl = this.gl;
+      const value = new Float32Array(1);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, sourceFramebuffer(channel));
+      gl.readPixels(x, y, 1, 1, gl.RED, gl.FLOAT, value);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      return value[0] || 0;
+    }
+
+    readChannel(channel) {
+      const gl = this.gl;
+      const values = new Float32Array(this.width * this.height);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, sourceFramebuffer(channel));
+      gl.readPixels(0, 0, this.width, this.height, gl.RED, gl.FLOAT, values);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      return values;
+    }
+
+    markFullSimulation() {
+      const chunks = Math.ceil(this.width / 32) * Math.ceil(this.height / 32) * Math.max(1, this.channels.length);
+      this.profile.activeChunks = chunks;
+      this.profile.simChunks = chunks;
+      this.profile.patches = 0;
+      this.profile.colorizeMs = 0;
+      this.profile.updateFieldBufferMs = 0;
+    }
+  }
+
+  const VERTEX_SHADER = `#version 300 es
+precision highp float;
+out vec2 vUv;
+void main() {
+  vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+  vUv = p;
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+  const STEP_FRAGMENT_SHADER = `#version 300 es
+precision highp float;
+precision highp int;
+uniform sampler2D uSourceField;
+uniform sampler2D uDestField;
+uniform sampler2D uKernel;
+uniform vec2 uWorldSize;
+uniform int uKernelCount;
+uniform float uMu;
+uniform float uSigma;
+uniform float uDt;
+uniform float uGain;
+uniform float uDecay;
+uniform float uAlpha;
+uniform bool uLimit;
+uniform bool uWrap;
+uniform int uDeltaMode;
+uniform bool uDiscrete;
+out float outValue;
+
+float clamp01(float value) {
+  return max(0.0, min(1.0, value));
+}
+
+float sampleSource(ivec2 cell) {
+  ivec2 size = ivec2(uWorldSize);
+  if (uWrap) {
+    cell = ivec2((cell.x % size.x + size.x) % size.x, (cell.y % size.y + size.y) % size.y);
+  } else if (cell.x < 0 || cell.y < 0 || cell.x >= size.x || cell.y >= size.y) {
+    return 0.0;
+  }
+  return texelFetch(uSourceField, cell, 0).r;
+}
+
+float growthCurve(float n) {
+  float distance = abs(n - uMu);
+  float squared = distance * distance;
+  if (uDeltaMode == 1) {
+    float reach = 9.0 * uSigma * uSigma;
+    return squared > reach ? -1.0 : pow(1.0 - squared / reach, uAlpha) * 2.0 - 1.0;
+  }
+  if (uDeltaMode == 2) {
+    float p = uSigma / 2.0;
+    float q = uSigma * 2.0;
+    if (distance <= p) return 1.0;
+    return distance <= q ? (2.0 * (q - distance)) / (q - p) - 1.0 : -1.0;
+  }
+  if (uDeltaMode == 3) {
+    return distance <= uSigma ? 1.0 : -1.0;
+  }
+  return 2.0 * exp(-squared / (2.0 * uSigma * uSigma)) - 1.0;
+}
+
+void main() {
+  ivec2 cell = ivec2(gl_FragCoord.xy);
+  float neighborhood = 0.0;
+  for (int i = 0; i < uKernelCount; i += 1) {
+    vec4 kernel = texelFetch(uKernel, ivec2(i, 0), 0);
+    ivec2 offset = ivec2(round(kernel.xy));
+    neighborhood += sampleSource(cell + offset) * kernel.z;
+  }
+  float current = texelFetch(uDestField, cell, 0).r;
+  float growth = growthCurve(neighborhood) * uGain;
+  float rawValue = current + uDt * growth - uDecay * current;
+  if (uDiscrete) outValue = rawValue > 0.5 ? 1.0 : 0.0;
+  else outValue = uLimit ? clamp01(rawValue) : max(0.0, rawValue);
+}`;
+
+  const RENDER_FRAGMENT_SHADER = `#version 300 es
+precision highp float;
+precision highp int;
+uniform sampler2D uField0;
+uniform sampler2D uField1;
+uniform sampler2D uField2;
+uniform sampler2D uField3;
+uniform sampler2D uField4;
+uniform sampler2D uField5;
+uniform sampler2D uField6;
+uniform sampler2D uField7;
+uniform vec2 uWorldSize;
+uniform vec2 uCssSize;
+uniform float uDpr;
+uniform vec3 uCamera;
+uniform bool uWrap;
+uniform int uChannelCount;
+uniform int uVisible[8];
+uniform int uPaletteCount[8];
+uniform vec3 uPalettes[64];
+uniform vec3 uBackground;
+out vec4 outColor;
+
+float sampleChannel(int channelIndex, ivec2 cell) {
+  if (channelIndex == 0) return texelFetch(uField0, cell, 0).r;
+  if (channelIndex == 1) return texelFetch(uField1, cell, 0).r;
+  if (channelIndex == 2) return texelFetch(uField2, cell, 0).r;
+  if (channelIndex == 3) return texelFetch(uField3, cell, 0).r;
+  if (channelIndex == 4) return texelFetch(uField4, cell, 0).r;
+  if (channelIndex == 5) return texelFetch(uField5, cell, 0).r;
+  if (channelIndex == 6) return texelFetch(uField6, cell, 0).r;
+  return texelFetch(uField7, cell, 0).r;
+}
+
+vec3 colorRamp(int channelIndex, float value) {
+  float clampedValue = max(0.0, min(1.0, value));
+  int paletteCount = max(1, uPaletteCount[channelIndex]);
+  float scaled = clampedValue * float(max(1, paletteCount - 1));
+  int base = int(floor(scaled));
+  float t = scaled - float(base);
+  int nextIndex = min(base + 1, paletteCount - 1);
+  int offset = channelIndex * 8;
+  return mix(uPalettes[offset + base], uPalettes[offset + nextIndex], t);
+}
+
+void main() {
+  vec2 screen = vec2(gl_FragCoord.x / uDpr, uCssSize.y - gl_FragCoord.y / uDpr);
+  vec2 world = (screen - uCssSize * 0.5) / uCamera.z + uCamera.xy;
+  if (uWrap) {
+    world = mod(world, uWorldSize);
+  } else if (world.x < 0.0 || world.y < 0.0 || world.x >= uWorldSize.x || world.y >= uWorldSize.y) {
+    outColor = vec4(uBackground, 1.0);
+    return;
+  }
+
+  ivec2 cell = ivec2(floor(world));
+  int visibleCount = 0;
+  int singleIndex = 0;
+  for (int i = 0; i < 8; i += 1) {
+    if (i < uChannelCount && uVisible[i] == 1) {
+      visibleCount += 1;
+      singleIndex = i;
+    }
+  }
+  if (visibleCount == 1) {
+    outColor = vec4(colorRamp(singleIndex, sampleChannel(singleIndex, cell)), 1.0);
+    return;
+  }
+
+  vec3 color = uBackground;
+  for (int i = 0; i < 8; i += 1) {
+    if (i >= uChannelCount || uVisible[i] == 0) continue;
+    float value = max(0.0, min(1.0, sampleChannel(i, cell)));
+    if (value <= 0.00001) continue;
+    vec3 layerColor = colorRamp(i, value);
+    float alpha = max(0.0, min(1.0, value * 0.86));
+    color = mix(color, layerColor, alpha);
+  }
+  outColor = vec4(color, 1.0);
+}`;
+
+  const BRUSH_FRAGMENT_SHADER = `#version 300 es
+precision highp float;
+precision highp int;
+uniform sampler2D uField;
+uniform vec2 uWorldSize;
+uniform vec2 uCenter;
+uniform float uRadius;
+uniform float uPower;
+uniform int uMode;
+uniform bool uWrap;
+uniform bool uDiscrete;
+out float outValue;
+
+float clamp01(float value) {
+  return max(0.0, min(1.0, value));
+}
+
+void main() {
+  ivec2 cell = ivec2(gl_FragCoord.xy);
+  float current = texelFetch(uField, cell, 0).r;
+  vec2 delta = vec2(cell) - uCenter;
+  if (uWrap) {
+    delta -= round(delta / uWorldSize) * uWorldSize;
+  }
+  float distance = length(delta);
+  if (distance > uRadius) {
+    outValue = current;
+    return;
+  }
+  if (uDiscrete) {
+    outValue = uMode == 1 ? 0.0 : 1.0;
+    return;
+  }
+  float falloff = uRadius <= 0.0 ? 1.0 : 1.0 - distance / uRadius;
+  if (uMode == 1) outValue = clamp01(current * (1.0 - falloff * uPower));
+  else outValue = clamp01(current + falloff * uPower);
+}`;
+
+  const PLACE_FRAGMENT_SHADER = `#version 300 es
+precision highp float;
+precision highp int;
+uniform sampler2D uField;
+uniform sampler2D uCells;
+uniform vec2 uWorldSize;
+uniform vec2 uCenter;
+uniform vec2 uCellSize;
+uniform float uScale;
+uniform float uAngle;
+uniform bool uWrap;
+uniform bool uDiscrete;
+out float outValue;
+
+void main() {
+  ivec2 cell = ivec2(gl_FragCoord.xy);
+  float current = texelFetch(uField, cell, 0).r;
+  vec2 delta = vec2(cell) + vec2(0.5) - uCenter;
+  if (uWrap) {
+    delta -= round(delta / uWorldSize) * uWorldSize;
+  }
+  float c = cos(uAngle);
+  float s = sin(uAngle);
+  vec2 source = vec2(c * delta.x + s * delta.y, -s * delta.x + c * delta.y) / max(0.0001, uScale) + uCellSize * 0.5;
+  ivec2 sourceCell = ivec2(floor(source));
+  if (sourceCell.x < 0 || sourceCell.y < 0 || sourceCell.x >= int(uCellSize.x) || sourceCell.y >= int(uCellSize.y)) {
+    outValue = current;
+    return;
+  }
+  float value = texelFetch(uCells, sourceCell, 0).r;
+  if (uDiscrete) outValue = max(current >= 0.5 ? 1.0 : 0.0, value >= 0.5 ? 1.0 : 0.0);
+  else outValue = max(current, value);
+}`;
+
+  const COPY_FRAGMENT_SHADER = `#version 300 es
+precision highp float;
+precision highp int;
+uniform sampler2D uOldField;
+uniform vec2 uOldSize;
+uniform vec2 uNewSize;
+uniform vec2 uOldOrigin;
+uniform vec2 uNewOrigin;
+uniform vec2 uCopySize;
+out float outValue;
+
+void main() {
+  vec2 cell = floor(gl_FragCoord.xy);
+  vec2 relative = cell - uNewOrigin;
+  if (relative.x < 0.0 || relative.y < 0.0 || relative.x >= uCopySize.x || relative.y >= uCopySize.y) {
+    outValue = 0.0;
+    return;
+  }
+  ivec2 oldCell = ivec2(relative + uOldOrigin);
+  outValue = texelFetch(uOldField, oldCell, 0).r;
+}`;
+
+  const CLEAR_FRAGMENT_SHADER = `#version 300 es
+precision highp float;
+out float outValue;
+void main() {
+  outValue = 0.0;
+}`;
+
+  const QUANTIZE_FRAGMENT_SHADER = `#version 300 es
+precision highp float;
+precision highp int;
+uniform sampler2D uField;
+out float outValue;
+void main() {
+  float value = texelFetch(uField, ivec2(gl_FragCoord.xy), 0).r;
+  outValue = value >= 0.5 ? 1.0 : 0.0;
+}`;
+
+  function createProgram(gl, vertexSource, fragmentSource) {
+    const vertex = compileShader(gl, gl.VERTEX_SHADER, vertexSource);
+    const fragment = compileShader(gl, gl.FRAGMENT_SHADER, fragmentSource);
+    const program = gl.createProgram();
+    gl.attachShader(program, vertex);
+    gl.attachShader(program, fragment);
+    gl.linkProgram(program);
+    gl.deleteShader(vertex);
+    gl.deleteShader(fragment);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      const log = gl.getProgramInfoLog(program) || "Unknown program link error";
+      gl.deleteProgram(program);
+      throw new Error(log);
+    }
+    return program;
+  }
+
+  function compileShader(gl, type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      const log = gl.getShaderInfoLog(shader) || "Unknown shader compile error";
+      gl.deleteShader(shader);
+      throw new Error(log);
+    }
+    return shader;
+  }
+
+  function bindTexture(gl, program, name, texture, unit) {
+    gl.activeTexture(gl.TEXTURE0 + unit);
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.uniform1i(gl.getUniformLocation(program, name), unit);
+  }
+
+  function normalizeModel(model = {}) {
+    const sourceChannels = Array.isArray(model.channels) && model.channels.length ? model.channels : legacyModel(model).channels;
+    const channels = sourceChannels.map((channel, index) => ({
+      id: String(channel.id || `channel-${index}`),
+      name: String(channel.name || `Layer ${index + 1}`),
+      palette: normalizePalette(channel.palette || channel.colors || DEFAULT_COLORS),
+      visible: channel.visible !== false,
+    }));
+    const ids = new Set(channels.map((channel) => channel.id));
+    const sourceRules = Array.isArray(model.rules) && model.rules.length ? model.rules : [model.rule || DEFAULT_RULE];
+    const rules = sourceRules.map((rule, index) => {
+      const fallbackId = channels[0]?.id || "channel-0";
+      return normalizeRule({
+        ...rule,
+        id: rule.id || `rule-${index}`,
+        sourceChannelId: ids.has(String(rule.sourceChannelId)) ? String(rule.sourceChannelId) : fallbackId,
+        destinationChannelId: ids.has(String(rule.destinationChannelId)) ? String(rule.destinationChannelId) : fallbackId,
+      });
+    });
+    return {
+      channels,
+      rules,
+      selectedChannelId: String(model.selectedChannelId || channels[0]?.id || "channel-0"),
+      metricScope: model.metricScope === "aggregate" ? "aggregate" : "selected",
+      wrapAround: model.wrapAround !== false,
+    };
+  }
+
+  function legacyModel(config = DEFAULT_RULE, colors = DEFAULT_COLORS) {
+    const rule = normalizeRule({ ...DEFAULT_RULE, ...config });
+    return {
+      selectedChannelId: "channel-0",
+      metricScope: "selected",
+      wrapAround: config?.wrapAround !== false,
+      channels: [{ id: "channel-0", name: "Layer 1", palette: colors && colors.length ? colors : DEFAULT_COLORS, visible: true }],
+      rules: [{ ...rule, id: "rule-0", sourceChannelId: "channel-0", destinationChannelId: "channel-0" }],
+    };
+  }
+
+  function currentModel(sim) {
+    return {
+      selectedChannelId: sim.selectedChannelId,
+      metricScope: sim.metricScope,
+      wrapAround: sim.wrapAround,
+      channels: sim.channels.map((channel) => ({
+        id: channel.id,
+        name: channel.name,
+        palette: [...channel.palette],
+        visible: channel.visible,
+      })),
+      rules: sim.rules.map(stripRuntimeRule),
+    };
+  }
+
+  function stripRuntimeRule(rule) {
+    return {
+      id: rule.id,
+      sourceChannelId: rule.sourceChannelId,
+      destinationChannelId: rule.destinationChannelId,
+      radius: rule.radius,
+      alpha: rule.alpha,
+      mu: rule.mu,
+      sigma: rule.sigma,
+      dt: rule.dt,
+      gain: rule.gain,
+      decay: rule.decay,
+      limitValue: rule.limitValue,
+      deltaName: rule.deltaName,
+      coreName: rule.coreName,
+      layer: rule.layer,
+      beta: [...rule.beta],
+      eta: [...rule.eta],
+    };
+  }
+
+  function normalizeRule(rule = {}) {
+    return {
+      id: String(rule.id || "rule-0"),
+      sourceChannelId: String(rule.sourceChannelId || rule.source || "channel-0"),
+      destinationChannelId: String(rule.destinationChannelId || rule.destination || "channel-0"),
+      radius: Number(rule.radius ?? 13),
+      alpha: Number(rule.alpha ?? 4),
+      mu: Number(rule.mu ?? 0.15),
+      sigma: Number(rule.sigma ?? 0.017),
+      dt: Number(rule.dt ?? 0.1),
+      gain: Number(rule.gain ?? 1),
+      decay: Number(rule.decay ?? 0),
+      limitValue: rule.limitValue !== false,
+      deltaName: rule.deltaName || "gaus",
+      coreName: rule.coreName || "bump4",
+      layer: Number(rule.layer || 0),
+      beta: [...(rule.beta || [1, 0, 0, 0])],
+      eta: [...(rule.eta || [0, 0, 0, 0])],
+      kernelTexture: null,
+      kernelCount: 0,
+    };
+  }
+
+  function normalizePalette(colors) {
+    const palette = colors && colors.length ? colors : DEFAULT_COLORS;
+    return palette.slice(0, 8).map((color) => String(color || DEFAULT_COLORS[0]));
+  }
+
+  function normalizeRect(rect, width, height) {
+    const source = rect || { left: 0, top: 0, right: width, bottom: height };
+    const left = Math.max(0, Math.min(width, Math.floor(source.left || 0)));
+    const top = Math.max(0, Math.min(height, Math.floor(source.top || 0)));
+    const right = Math.max(left, Math.min(width, Math.ceil(source.right ?? width)));
+    const bottom = Math.max(top, Math.min(height, Math.ceil(source.bottom ?? height)));
+    return { left, top, right, bottom };
+  }
+
+  function isDiscreteRule(rule) {
+    return rule.coreName === "life";
+  }
+
+  function isDiscreteChannel(rules, channelId) {
+    return rules.some((rule) => rule.destinationChannelId === channelId && isDiscreteRule(rule));
+  }
+
+  function coreValue(config, r) {
+    const alpha = config.alpha;
+    if (r < 0 || r > 1) return 0;
+    const k = 4 * r * (1 - r);
+    switch (config.coreName) {
+      case "quad4":
+        return k <= 0 ? 0 : Math.pow(k, alpha);
+      case "trap1/5": {
+        const q = 1 / 5;
+        if (r < q || r > 1 - q) return 0;
+        if (r < 2 * q) return (r - q) / q;
+        if (r > 1 - 2 * q) return (1 - q - r) / q;
+        return 1;
+      }
+      case "stpz1/4": {
+        const q = 1 / 4;
+        return r >= q && r <= 1 - q ? 1 : 0;
+      }
+      case "life": {
+        const q = 1 / 4;
+        if (r < q) return 0.5;
+        return r > 1 - q ? 0 : 1;
+      }
+      case "bump4":
+      default:
+        if (r <= 0 || r >= 1 || k <= 0) return 0;
+        return Math.exp(alpha * (1 - 1 / k));
+    }
+  }
+
+  function kernelValue(config, r) {
+    const distance = Math.abs(r);
+    if (config.layer === 0) return coreValue(config, distance);
+    if (distance >= 1) return 0;
+    const layers = config.layer + 1;
+    const scaled = distance * layers;
+    const betaIndex = Math.floor(scaled);
+    const etaIndex = Math.floor(scaled + 0.5);
+    const eta = etaIndex <= config.layer ? config.eta[etaIndex] : 0;
+    return coreValue(config, scaled % 1) * ((config.beta[betaIndex] || 0) - eta) + eta;
+  }
+
+  function deltaMode(name) {
+    if (name === "quad4") return 1;
+    if (name === "trap") return 2;
+    if (name === "stpz") return 3;
+    return 0;
+  }
+
+  function hexToRgb(hex) {
+    const clean = String(hex || "#000000").replace("#", "");
+    const full = clean.length === 3 ? clean.split("").map((part) => part + part).join("") : clean;
+    const value = Number.parseInt(full, 16);
+    return [(value >> 16) & 255, (value >> 8) & 255, value & 255];
+  }
+
+  function flattenPalettes(channels) {
+    const data = new Float32Array(MAX_RENDER_CHANNELS * 8 * 3);
+    for (let channelIndex = 0; channelIndex < Math.min(MAX_RENDER_CHANNELS, channels.length); channelIndex += 1) {
+      const palette = normalizePalette(channels[channelIndex].palette).map(hexToRgb);
+      for (let i = 0; i < Math.min(8, palette.length); i += 1) {
+        const p = (channelIndex * 8 + i) * 3;
+        data[p] = palette[i][0] / 255;
+        data[p + 1] = palette[i][1] / 255;
+        data[p + 2] = palette[i][2] / 255;
+      }
+    }
+    return data;
+  }
+
+  function visibleArray(channels) {
+    const data = new Int32Array(MAX_RENDER_CHANNELS);
+    for (let i = 0; i < Math.min(MAX_RENDER_CHANNELS, channels.length); i += 1) data[i] = channels[i].visible ? 1 : 0;
+    return data;
+  }
+
+  function paletteCountArray(channels) {
+    const data = new Int32Array(MAX_RENDER_CHANNELS);
+    for (let i = 0; i < Math.min(MAX_RENDER_CHANNELS, channels.length); i += 1) {
+      data[i] = Math.max(1, Math.min(8, channels[i].palette.length));
+    }
+    return data;
+  }
+
+  function emptyMetrics(selectedChannelId, metricScope) {
+    return {
+      mass: 0,
+      growth: 0,
+      energy: 0,
+      selectedChannelId,
+      scope: metricScope,
+      perChannel: {},
+      aggregate: { mass: 0, growth: 0, energy: 0 },
+    };
+  }
+
+  function sourceTexture(channel) {
+    return channel.textures[channel.sourceIndex];
+  }
+
+  function destinationTexture(channel) {
+    return channel.textures[1 - channel.sourceIndex];
+  }
+
+  function sourceFramebuffer(channel) {
+    return channel.framebuffers[channel.sourceIndex];
+  }
+
+  function destinationFramebuffer(channel) {
+    return channel.framebuffers[1 - channel.sourceIndex];
+  }
+
+  function swap(channel) {
+    channel.sourceIndex = 1 - channel.sourceIndex;
+  }
+
+  function deleteChannel(gl, channel) {
+    for (const texture of channel.textures || []) gl.deleteTexture(texture);
+    for (const framebuffer of channel.framebuffers || []) gl.deleteFramebuffer(framebuffer);
+  }
+
+  function clamp(value, low = 0, high = 1) {
+    return Math.max(low, Math.min(high, value));
+  }
+
+  window.WebGLLeniaSim = WebGLLeniaSim;
+})();
