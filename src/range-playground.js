@@ -22,6 +22,9 @@ const ui = {
   backendSelect: document.querySelector("#backendSelect"),
   backendLabel: document.querySelector("#backendLabel"),
   worldSizeSelect: document.querySelector("#worldSizeSelect"),
+  customWorldSizeFields: document.querySelector("#customWorldSizeFields"),
+  customWorldWidth: document.querySelector("#customWorldWidth"),
+  customWorldHeight: document.querySelector("#customWorldHeight"),
   radiusSlider: document.querySelector("#radiusSlider"),
   radiusValue: document.querySelector("#radiusValue"),
   alphaSlider: document.querySelector("#alphaSlider"),
@@ -95,6 +98,7 @@ const ui = {
   brushPowerSlider: document.querySelector("#brushPowerSlider"),
   brushPowerValue: document.querySelector("#brushPowerValue"),
   formSearch: document.querySelector("#formSearch"),
+  collectionSelect: document.querySelector("#collectionSelect"),
   groupSelect: document.querySelector("#groupSelect"),
   prevGroupBtn: document.querySelector("#prevGroupBtn"),
   nextGroupBtn: document.querySelector("#nextGroupBtn"),
@@ -145,20 +149,22 @@ const ui = {
 const ZIP_HEADER = "(zip)";
 const ZIP2_HEADER = "(zip2)";
 const ZIP_START = 192;
-const COMPATIBLE_GROUPS_URL = "strictly-compatible-groups.txt";
+const COMPATIBLE_GROUPS_URL = "docs/strictly-compatible-groups.txt";
 const LIFEFORM_ASSET_BASE = "assets/lifeforms/";
 const SKIP_GROUP_ALERT_KEY = "leniency.skipGroupChangeAlert";
 const DEFAULT_WORLD_SIZE = 128;
+const MIN_WORLD_SIZE = 16;
+const MAX_WORLD_SIZE = 2048;
 const DEFAULT_FORM_NAME = "Orbium unicaudatus";
 const MAP_FILE_VERSION = 2;
+const MAX_CHANNELS = 3;
+const WEBGL_MAX_RULES = 8;
 const SNAPSHOT_TIMEOUT_MS = 8000;
 const DEFAULT_COLORS = ["#080618", "#231c49", "#3e3f77", "#8889bc", "#f0efd6"];
 const NEW_LAYER_PALETTES = [
   ["#140704", "#4c160b", "#a23a16", "#e98331", "#ffe0a3"],
-  ["#03120a", "#104326", "#2c7f45", "#73c969", "#e1ffd0"],
-  ["#10071a", "#321653", "#6b35a0", "#b276e7", "#f0d7ff"],
-  ["#151002", "#51400b", "#a68016", "#e4c53c", "#fff3a8"],
-  DEFAULT_COLORS,
+  ["#170604", "#5a120a", "#b42713", "#ff6d2a", "#ffd39b"],
+  ["#180b02", "#5a2508", "#b65213", "#f39a2e", "#ffe6a8"],
 ];
 const DEFAULT_RULE = {
   id: "rule-0",
@@ -175,6 +181,8 @@ const DEFAULT_RULE = {
   layer: 0,
   beta: [1, 0, 0, 0],
   eta: [0, 0, 0, 0],
+  weight: 1,
+  positiveOnly: false,
 };
 const DEFAULT_ADVANCED = {
   radius: 13,
@@ -240,9 +248,11 @@ let selectedChannelId = "channel-0";
 let nextChannelSerial = 1;
 let nextLayerPaletteIndex = 0;
 let metricScope = "selected";
-let compatibleForms = [];
-let compatibleGroups = [];
+let catalogForms = [];
+let lifeformCollections = [];
+let activeCollectionIndex = -1;
 let activeGroupIndex = -1;
+let pendingCollectionIndex = -1;
 let pendingGroupIndex = -1;
 let selectedForm = null;
 let pendingPlacement = null;
@@ -258,7 +268,7 @@ let snapshotRequestId = 0;
 const pendingSnapshotRequests = new Map();
 let webglSim = null;
 let webglUnavailableReason = "";
-let backendPreference = "auto";
+let backendPreference = "cpu";
 let activeBackend = "cpu";
 let lastFrameAt = 0;
 let renderFrameCount = 0;
@@ -568,12 +578,32 @@ function displayCode(rawCode) {
   return String(rawCode || "").replace(/^[~*]/, "");
 }
 
-function lifeformAssetSlug(index, code) {
+function lifeformAssetSlug(index, code, assetPrefix = "") {
   const cleanCode = String(code || "form")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
-  return `lifeform-${index}-${cleanCode || "form"}`;
+  const cleanPrefix = String(assetPrefix || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return `lifeform-${cleanPrefix ? `${cleanPrefix}-` : ""}${index}-${cleanCode || "form"}`;
+}
+
+function slugify(value) {
+  return (
+    String(value || "")
+      .toLowerCase()
+      .replace(/^[~*]+/, "")
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "group"
+  );
+}
+
+function cleanGroupName(value) {
+  return String(value || "")
+    .replace(/^(class|order|family|subfamily|subphylum):\s*/i, "")
+    .trim();
 }
 
 function normalizeLookupText(value) {
@@ -781,9 +811,105 @@ function buildLegacyCompatibleGroup(forms) {
   };
 }
 
-function defaultGroupIndex() {
-  const legacyIndex = compatibleGroups.findIndex((group) => group.id === "legacy-compatible-forms");
+function collectionFormCount(collection) {
+  return new Set((collection?.groups || []).flatMap((group) => group.forms.map((form) => form.id))).size;
+}
+
+function buildStrictCompatibleCollection(groups) {
+  return {
+    id: "strictly-compatible",
+    title: "Strictly compatible",
+    groups: groups.map((group, index) => ({
+      ...group,
+      id: `strictly-compatible-${index}`,
+      collectionId: "strictly-compatible",
+      collectionTitle: "Strictly compatible",
+    })),
+  };
+}
+
+function buildLegacyCollection(group) {
+  if (!group) return null;
+  return {
+    id: "legacy",
+    title: "Legacy",
+    groups: [
+      {
+        ...group,
+        collectionId: "legacy",
+        collectionTitle: "Legacy",
+      },
+    ],
+  };
+}
+
+function repositoryGroupKey(form) {
+  const groups = (form.groups || []).map(cleanGroupName).filter(Boolean);
+  return groups.length ? groups.join(" / ") : form.sourceTitle || "Lenia repository";
+}
+
+function buildAllLifeformsCollection(forms) {
+  if (!forms.length) return null;
+  const groupMap = new Map();
+  for (const form of forms) {
+    const key = repositoryGroupKey(form);
+    if (!groupMap.has(key)) {
+      const parts = key.split(" / ");
+      groupMap.set(key, {
+        title: parts[parts.length - 1] || "Unclassified",
+        path: key,
+        forms: [],
+      });
+    }
+    groupMap.get(key).forms.push(form);
+  }
+
+  const groups = [...groupMap.values()].map((entry, index) => ({
+    id: `all-lifeforms-${index}-${slugify(entry.path)}`,
+    collectionId: "all-lifeforms",
+    collectionTitle: "All lifeforms",
+    title: entry.title,
+    ruleText: `Lenia repository catalog: ${entry.path}. Selecting a lifeform applies that lifeform's field values.`,
+    ruleInfo: entry.forms[0].ruleInfo,
+    items: [],
+    forms: entry.forms,
+    missingItems: [],
+    perFormRule: true,
+  }));
+
+  return {
+    id: "all-lifeforms",
+    title: "All lifeforms",
+    groups,
+  };
+}
+
+function buildLifeformCollections(strictGroups, legacyGroup, repositoryForms) {
+  return [
+    buildStrictCompatibleCollection(strictGroups),
+    buildLegacyCollection(legacyGroup),
+    buildAllLifeformsCollection(repositoryForms),
+  ].filter((collection) => collection?.groups.length);
+}
+
+function activeCollection() {
+  return lifeformCollections[activeCollectionIndex] || null;
+}
+
+function collectionGroups(collection = activeCollection()) {
+  return collection?.groups || [];
+}
+
+function defaultCollectionIndex() {
+  const legacyIndex = lifeformCollections.findIndex((collection) => collection.id === "legacy");
   return legacyIndex >= 0 ? legacyIndex : 0;
+}
+
+function defaultGroupIndex(collection = activeCollection()) {
+  const groups = collectionGroups(collection);
+  const defaultName = normalizeLookupText(DEFAULT_FORM_NAME);
+  const index = groups.findIndex((group) => group.forms.some((form) => normalizeLookupText(form.name) === defaultName));
+  return index >= 0 ? index : 0;
 }
 
 function defaultFormForGroup(group) {
@@ -792,47 +918,82 @@ function defaultFormForGroup(group) {
   return group.forms.find((form) => normalizeLookupText(form.name) === defaultName) || group.forms[0];
 }
 
-function buildLibraryForms() {
-  const source = [
-    ...(Array.isArray(window.animalArr) ? window.animalArr : []),
-    ...(Array.isArray(window.extraCompatibleAnimalArr) ? window.extraCompatibleAnimalArr : []),
+function baseLifeformSources() {
+  const animalArr = Array.isArray(window.animalArr) ? window.animalArr : [];
+  return [
+    {
+      id: "bundled-lenia",
+      title: "Bundled Lenia",
+      entries: animalArr,
+      indexOffset: 0,
+      assetPrefix: "",
+    },
+    {
+      id: "compatible-extra",
+      title: "Compatible extras",
+      entries: Array.isArray(window.extraCompatibleAnimalArr) ? window.extraCompatibleAnimalArr : [],
+      indexOffset: animalArr.length,
+      assetPrefix: "",
+    },
   ];
+}
+
+function repositoryLifeformSources() {
+  return [
+    {
+      id: "lenia-repository",
+      title: "Lenia repository",
+      entries: Array.isArray(window.leniaRepositoryAnimalArr) ? window.leniaRepositoryAnimalArr : [],
+      indexOffset: 0,
+      assetPrefix: "lenia",
+    },
+  ];
+}
+
+function buildLibraryForms(sources = baseLifeformSources()) {
   const forms = [];
-  const groupStack = [];
 
-  for (let i = 0; i < source.length; i += 1) {
-    const item = source[i];
-    if (!Array.isArray(item)) continue;
-    if (item.length === 3 && item[1]) {
-      const level = Number.parseInt(String(item[0]).replace(/^\D+/, ""), 10) || 1;
-      groupStack[level - 1] = item[1];
-      groupStack.length = level;
-      continue;
+  for (const source of sources) {
+    const groupStack = [];
+    const entries = Array.isArray(source.entries) ? source.entries : [];
+    for (let i = 0; i < entries.length; i += 1) {
+      const item = entries[i];
+      if (!Array.isArray(item)) continue;
+      if (item.length === 3 && item[1]) {
+        const level = Number.parseInt(String(item[0]).replace(/^\D+/, ""), 10) || 1;
+        groupStack[level - 1] = item[1];
+        groupStack.length = level;
+        continue;
+      }
+      if (item.length < 4 || !item[3]) continue;
+
+      const { rule, cells } = splitLifeformPayload(item[3]);
+      const ruleInfo = parseRule(rule);
+
+      const code = displayCode(item[0]);
+      const index = Number(source.indexOffset || 0) + i;
+      const assetSlug = lifeformAssetSlug(index, code, source.assetPrefix);
+      const groups = groupStack.filter(Boolean);
+      forms.push({
+        id: `${source.id}-${index}-${code || i}`,
+        sourceId: source.id,
+        sourceTitle: source.title,
+        sourceIndex: i,
+        index,
+        code,
+        assetPath: `${LIFEFORM_ASSET_BASE}${assetSlug}.png`,
+        rawCode: item[0] || "",
+        name: item[1] || code,
+        section: cleanGroupName(groups[groups.length - 1]) || source.title || "",
+        groups,
+        rule,
+        cells,
+        ruleInfo,
+        cellData: null,
+        previewCanvas: null,
+        previewVersion: -1,
+      });
     }
-    if (item.length < 4 || !item[3]) continue;
-
-    const { rule, cells } = splitLifeformPayload(item[3]);
-    const ruleInfo = parseRule(rule);
-
-    const code = displayCode(item[0]);
-    const assetSlug = lifeformAssetSlug(i, code);
-    const groups = groupStack.filter(Boolean);
-    forms.push({
-      id: `${i}-${code}`,
-      index: i,
-      code,
-      assetPath: `${LIFEFORM_ASSET_BASE}${assetSlug}.png`,
-      rawCode: item[0] || "",
-      name: item[1] || code,
-      section: groups[groups.length - 1]?.replace(/^(class|order|family|subfamily):\s*/i, "") || "",
-      groups,
-      rule,
-      cells,
-      ruleInfo,
-      cellData: null,
-      previewCanvas: null,
-      previewVersion: -1,
-    });
   }
 
   return forms;
@@ -854,11 +1015,19 @@ function hexToRgb(hex) {
 }
 
 function cloneRule(rule) {
+  const sourceChannelId = String(rule?.sourceChannelId || rule?.src || rule?.source || DEFAULT_RULE.sourceChannelId);
+  const destinationChannelId = String(
+    rule?.destinationChannelId || rule?.dst || rule?.destination || DEFAULT_RULE.destinationChannelId,
+  );
   return {
     ...DEFAULT_RULE,
     ...rule,
+    sourceChannelId,
+    destinationChannelId,
     beta: [...(rule?.beta || DEFAULT_RULE.beta)],
     eta: [...(rule?.eta || DEFAULT_RULE.eta)],
+    weight: Number(rule?.weight ?? DEFAULT_RULE.weight),
+    positiveOnly: Boolean(rule?.positiveOnly),
   };
 }
 
@@ -887,7 +1056,9 @@ function channelById(channelId) {
 }
 
 function ensureLayerRule(channelId = selectedChannelId) {
-  let rule = rules.find((item) => item.destinationChannelId === channelId);
+  let rule =
+    rules.find((item) => item.sourceChannelId === channelId && item.destinationChannelId === channelId) ||
+    rules.find((item) => item.destinationChannelId === channelId);
   if (!rule) {
     rule = cloneRule({
       id: `rule-${channelId}`,
@@ -902,6 +1073,30 @@ function ensureLayerRule(channelId = selectedChannelId) {
 
 function selectedRule() {
   return ensureLayerRule(selectedChannelId);
+}
+
+function hasCrossChannelRule(src, dst) {
+  return rules.some((rule) => rule.sourceChannelId === src && rule.destinationChannelId === dst);
+}
+
+function createCrossChannelRule(src, dst, overrides = {}) {
+  return cloneRule({
+    ...selectedRule(),
+    ...overrides,
+    id: `rule-${src}-to-${dst}`,
+    sourceChannelId: src,
+    destinationChannelId: dst,
+    weight: Number(overrides.weight ?? 0.35),
+    positiveOnly: overrides.positiveOnly !== false,
+  });
+}
+
+function crossRulesForChannel(channelId) {
+  return rules.filter(
+    (rule) =>
+      rule.sourceChannelId !== rule.destinationChannelId &&
+      (rule.sourceChannelId === channelId || rule.destinationChannelId === channelId),
+  );
 }
 
 function writeSelectedRuleFromControls() {
@@ -955,7 +1150,7 @@ function simulationModel() {
     selectedChannelId,
     metricScope,
     wrapAround: ui.wrapToggle.checked,
-    channels: channels.map((channel) => ({
+    channels: channels.slice(0, MAX_CHANNELS).map((channel) => ({
       id: channel.id,
       name: channel.name,
       palette: normalizePalette(channel.palette),
@@ -963,6 +1158,8 @@ function simulationModel() {
     })),
     rules: rules.map((rule) => ({
       id: rule.id,
+      src: rule.sourceChannelId,
+      dst: rule.destinationChannelId,
       sourceChannelId: rule.sourceChannelId,
       destinationChannelId: rule.destinationChannelId,
       radius: rule.radius,
@@ -978,6 +1175,8 @@ function simulationModel() {
       layer: rule.layer,
       beta: [...rule.beta],
       eta: [...rule.eta],
+      weight: Number(rule.weight ?? 1),
+      positiveOnly: Boolean(rule.positiveOnly),
     })),
   };
 }
@@ -1088,7 +1287,11 @@ function currentConfig() {
     layer: rule.layer,
     beta: [...rule.beta],
     eta: [...rule.eta],
+    weight: Number(rule.weight ?? 1),
+    positiveOnly: Boolean(rule.positiveOnly),
     id: rule.id,
+    src: rule.sourceChannelId,
+    dst: rule.destinationChannelId,
     sourceChannelId: rule.sourceChannelId,
     destinationChannelId: rule.destinationChannelId,
   };
@@ -1127,6 +1330,7 @@ function pendingPlacementMapInfo() {
 }
 
 function buildMapConfiguration(snapshot) {
+  const collection = activeCollection();
   const group = activeGroup();
   const model = simulationModel();
   return {
@@ -1151,7 +1355,10 @@ function buildMapConfiguration(snapshot) {
     camera: { ...camera },
     gamePlayer: { ...gamePlayer },
     library: {
+      activeCollectionIndex,
       activeGroupIndex,
+      collectionId: collection?.id || null,
+      collectionTitle: collection?.title || null,
       groupId: group?.id || null,
       groupTitle: group?.title || null,
       groupRule: group?.ruleText || null,
@@ -1289,12 +1496,21 @@ async function saveMapFile() {
 function modelFromMap(map) {
   const layerConfig = map.configuration?.layers;
   if (layerConfig?.channels?.length) {
+    const nextChannels = layerConfig.channels.slice(0, MAX_CHANNELS).map(cloneChannel);
+    const ids = new Set(nextChannels.map((channel) => channel.id));
+    const fallbackId = nextChannels[0]?.id || "channel-0";
+    const nextRules = (layerConfig.rules || []).map(cloneRule).map((rule, index) => ({
+      ...rule,
+      id: rule.id || `rule-${index}`,
+      sourceChannelId: ids.has(rule.sourceChannelId) ? rule.sourceChannelId : fallbackId,
+      destinationChannelId: ids.has(rule.destinationChannelId) ? rule.destinationChannelId : fallbackId,
+    }));
     return {
       selectedChannelId: layerConfig.selectedChannelId || layerConfig.channels[0].id,
       metricScope: layerConfig.metricScope === "aggregate" ? "aggregate" : "selected",
       wrapAround: layerConfig.wrapAround !== false,
-      channels: layerConfig.channels.map(cloneChannel),
-      rules: (layerConfig.rules || []).map(cloneRule),
+      channels: nextChannels,
+      rules: nextRules,
     };
   }
 
@@ -1371,7 +1587,7 @@ async function loadMapFile(file) {
     applyLoadedModel(model);
     worldWidth = width;
     worldHeight = height;
-    ui.worldSizeSelect.value = String(width);
+    syncWorldSizeControl(width);
     camera.x = worldWidth / 2;
     camera.y = worldHeight / 2;
     gamePlayer.x = worldWidth / 2;
@@ -1408,6 +1624,28 @@ function setSliderValue(slider, value) {
   slider.value = String(clamp(value, min, max));
 }
 
+function normalizeWorldSize(value) {
+  const parsed = Math.round(Number(value));
+  if (!Number.isFinite(parsed)) return worldWidth;
+  return Math.round(clamp(parsed, MIN_WORLD_SIZE, MAX_WORLD_SIZE));
+}
+
+function syncWorldSizeControl(width = worldWidth, height = worldHeight, { forceCustom = false } = {}) {
+  const text = String(width);
+  const hasPreset =
+    !forceCustom && width === height && [...ui.worldSizeSelect.options].some((option) => option.value === text);
+  ui.worldSizeSelect.value = hasPreset ? text : "custom";
+  if (ui.customWorldSizeFields) ui.customWorldSizeFields.hidden = hasPreset;
+  if (ui.customWorldWidth) ui.customWorldWidth.value = String(width);
+  if (ui.customWorldHeight) ui.customWorldHeight.value = String(height);
+}
+
+function resizeFromCustomWorldSize() {
+  const width = normalizeWorldSize(ui.customWorldWidth?.value);
+  const height = normalizeWorldSize(ui.customWorldHeight?.value);
+  resizeWorld(width, height);
+}
+
 function postWorker(type, payload = {}, transfer = []) {
   if (!simWorker) return;
   simWorker.postMessage({ type, ...payload }, transfer);
@@ -1421,6 +1659,41 @@ function backendReady() {
   return usingWebgl() || workerReady;
 }
 
+function webglUnavailableForModel(model = simulationModel()) {
+  if (model.channels.length < 1) return "Model has no layers.";
+  if (model.channels.length > MAX_CHANNELS) return `WebGL v1 supports up to ${MAX_CHANNELS} layers.`;
+  if (model.rules.length > WEBGL_MAX_RULES) return `WebGL v1 supports up to ${WEBGL_MAX_RULES} rules.`;
+  const ids = new Set(model.channels.map((channel) => channel.id));
+  if (model.rules.some((rule) => !ids.has(rule.sourceChannelId) || !ids.has(rule.destinationChannelId))) {
+    return "WebGL rules need valid source and destination layers.";
+  }
+  return "";
+}
+
+function modelCanUseWebgl(model = simulationModel()) {
+  return !webglUnavailableForModel(model);
+}
+
+function switchFromWebglToCpu(model) {
+  const snapshot = webglSim?.snapshot();
+  activeBackend = "cpu";
+  glCanvas.hidden = true;
+  startWorker();
+  if (snapshot) {
+    postWorker("loadSnapshot", {
+      snapshot: {
+        ...snapshot,
+        model,
+        simTime,
+      },
+    });
+  } else {
+    postWorker("model", { model });
+  }
+  setStateLabel();
+  syncBackendLabel();
+}
+
 function backendName() {
   return usingWebgl() ? "WebGL" : "CPU";
 }
@@ -1429,7 +1702,7 @@ function syncBackendLabel() {
   const suffix = backendPreference === "auto" ? " auto" : "";
   ui.backendLabel.textContent = `${backendName()}${suffix}`;
   ui.backendLabel.title = usingWebgl()
-    ? "WebGL float-texture simulation. Step sim is CPU dispatch time unless GPU timer support is added."
+    ? "WebGL packed float-texture simulation. Step sim is CPU dispatch time unless GPU timer support is added."
     : webglUnavailableReason
       ? `CPU worker fallback. WebGL unavailable: ${webglUnavailableReason}`
       : "CPU worker simulation";
@@ -1446,8 +1719,16 @@ function setStateLabel() {
 
 function configureBackend() {
   const model = simulationModel();
-  if (usingWebgl()) webglSim.setModel(model);
-  else postWorker("model", { model });
+  if (usingWebgl() && modelCanUseWebgl(model)) {
+    webglSim.setModel(model);
+    return;
+  }
+  if (usingWebgl()) {
+    webglUnavailableReason = webglUnavailableForModel(model);
+    switchFromWebglToCpu(model);
+    return;
+  }
+  postWorker("model", { model });
 }
 
 function setBackendPalette() {
@@ -1475,7 +1756,7 @@ function sendBackend(type, payload = {}, transfer = []) {
     metrics = webglSim.metrics;
     profile = { ...profile, ...webglSim.profile };
   } else if (type === "randomize") {
-    webglSim.randomize(payload.rect);
+    webglSim.randomize(payload.rect, payload.channelId);
     metrics = webglSim.metrics;
     profile = { ...profile, ...webglSim.profile };
   } else if (type === "place") {
@@ -1577,7 +1858,7 @@ function rebuildPalette() {
   channel.palette = ui.colorInputs.map((input) => input.value);
   syncPaletteControls();
   paletteVersion += 1;
-  for (const form of compatibleForms) {
+  for (const form of catalogForms) {
     form.previewVersion = -1;
   }
   resetRenderBuffer();
@@ -1653,7 +1934,17 @@ function renderLayerPanel() {
     name.textContent = channel.name;
     const link = document.createElement("span");
     link.className = "layer-link";
-    link.textContent = `${channelById(rule.sourceChannelId)?.name || "Missing"} -> ${channel.name}`;
+    const crossLinks = crossRulesForChannel(channel.id)
+      .slice(0, 2)
+      .map(
+        (crossRule) =>
+          `${channelById(crossRule.sourceChannelId)?.name || "Missing"} -> ${
+            channelById(crossRule.destinationChannelId)?.name || "Missing"
+          }`,
+      );
+    link.textContent = crossLinks.length
+      ? `${channelById(rule.sourceChannelId)?.name || "Missing"} -> ${channel.name}; ${crossLinks.join(", ")}`
+      : `${channelById(rule.sourceChannelId)?.name || "Missing"} -> ${channel.name}`;
     button.append(swatch, name, link);
     button.addEventListener("click", () => selectLayer(channel.id));
     ui.layerList.append(button);
@@ -1661,6 +1952,7 @@ function renderLayerPanel() {
 
   const channel = selectedChannel();
   const rule = selectedRule();
+  ui.addLayerBtn.disabled = channels.length >= MAX_CHANNELS;
   ui.removeLayerBtn.disabled = channels.length <= 1;
   ui.layerDestinationLabel.textContent = channel?.name || "-";
   ui.layerSourceSelect.innerHTML = "";
@@ -1682,7 +1974,9 @@ function selectLayer(channelId) {
 }
 
 function addLayer() {
+  if (channels.length >= MAX_CHANNELS) return;
   writeSelectedRuleFromControls();
+  const baseChannelId = channels[0]?.id || "channel-0";
   const id = `channel-${nextChannelSerial}`;
   nextChannelSerial += 1;
   const paletteSource = NEW_LAYER_PALETTES[nextLayerPaletteIndex % NEW_LAYER_PALETTES.length];
@@ -1701,6 +1995,24 @@ function addLayer() {
       destinationChannelId: id,
     }),
   );
+  if (baseChannelId !== id && !hasCrossChannelRule(id, baseChannelId)) {
+    rules.push(
+      createCrossChannelRule(id, baseChannelId, {
+        id: `rule-${id}-feeds-${baseChannelId}`,
+        weight: 0.16,
+        positiveOnly: true,
+      }),
+    );
+  }
+  if (baseChannelId !== id && !hasCrossChannelRule(baseChannelId, id)) {
+    rules.push(
+      createCrossChannelRule(baseChannelId, id, {
+        id: `rule-${baseChannelId}-feeds-${id}`,
+        weight: 0.12,
+        positiveOnly: true,
+      }),
+    );
+  }
   selectedChannelId = id;
   syncSelectedLayerControls();
   configureBackend();
@@ -1777,17 +2089,20 @@ function randomizeField() {
   requestRender();
 }
 
-function resizeWorld(newSize) {
+function resizeWorld(newWidth, newHeight = newWidth) {
+  newWidth = normalizeWorldSize(newWidth);
+  newHeight = normalizeWorldSize(newHeight);
   const oldWidth = worldWidth;
   const oldHeight = worldHeight;
-  worldWidth = newSize;
-  worldHeight = newSize;
+  worldWidth = newWidth;
+  worldHeight = newHeight;
   camera.x += (worldWidth - oldWidth) / 2;
   camera.y += (worldHeight - oldHeight) / 2;
   gamePlayer.x += (worldWidth - oldWidth) / 2;
   gamePlayer.y += (worldHeight - oldHeight) / 2;
   makeBuffers();
   clampCamera();
+  syncWorldSizeControl(worldWidth, worldHeight);
   sendBackend("resize", { width: worldWidth, height: worldHeight });
   requestRender();
 }
@@ -2000,13 +2315,22 @@ function selectForm(form) {
   if (!selectedForm.cellData) selectedForm.cellData = parseCellArray(selectedForm.cells);
   const group = activeGroup();
   if (group?.perFormRule) applyRuleInfo(selectedForm.ruleInfo);
-  ui.selectedForm.textContent = `${selectedForm.code} - ${selectedForm.name}\n${group ? group.title : ""}`;
+  const collection = activeCollection();
+  ui.selectedForm.textContent = `${selectedForm.code} - ${selectedForm.name}\n${
+    collection && group ? `${collection.title} / ${group.title}` : group?.title || ""
+  }`;
   renderGroupOrganizer();
   renderFormList();
 }
 
 function activeGroup() {
-  return compatibleGroups[activeGroupIndex] || null;
+  return collectionGroups()[activeGroupIndex] || null;
+}
+
+function formSearchText(form) {
+  return `${form.code} ${form.rawCode} ${form.name} ${form.section} ${(form.groups || []).join(" ")} ${
+    form.sourceTitle || ""
+  }`.toLowerCase();
 }
 
 function renderFormList() {
@@ -2015,8 +2339,7 @@ function renderFormList() {
   const forms = group ? group.forms : [];
   ui.formList.innerHTML = "";
   for (const form of forms) {
-    const haystack = `${form.code} ${form.name} ${form.section}`.toLowerCase();
-    if (query && !haystack.includes(query)) continue;
+    if (query && !formSearchText(form).includes(query)) continue;
 
     const button = document.createElement("button");
     button.type = "button";
@@ -2056,8 +2379,21 @@ function renderFormList() {
 }
 
 function renderGroupOrganizer() {
+  ui.collectionSelect.innerHTML = "";
+  lifeformCollections.forEach((collection, index) => {
+    const option = document.createElement("option");
+    option.value = String(index);
+    option.textContent = `${collection.title} (${collectionFormCount(collection)})`;
+    ui.collectionSelect.append(option);
+  });
+
+  const collection = activeCollection();
+  const groups = collectionGroups(collection);
+  ui.collectionSelect.disabled = lifeformCollections.length <= 1;
+  if (collection) ui.collectionSelect.value = String(activeCollectionIndex);
+
   ui.groupSelect.innerHTML = "";
-  compatibleGroups.forEach((group, index) => {
+  groups.forEach((group, index) => {
     const option = document.createElement("option");
     option.value = String(index);
     option.textContent = `${index + 1}. ${group.title} (${group.forms.length})`;
@@ -2065,15 +2401,18 @@ function renderGroupOrganizer() {
   });
 
   const group = activeGroup();
-  ui.groupSelect.disabled = compatibleGroups.length <= 1;
-  ui.prevGroupBtn.disabled = compatibleGroups.length <= 1;
-  ui.nextGroupBtn.disabled = compatibleGroups.length <= 1;
+  ui.groupSelect.disabled = groups.length <= 1;
+  ui.prevGroupBtn.disabled = groups.length <= 1;
+  ui.nextGroupBtn.disabled = groups.length <= 1;
+  ui.libraryCount.textContent = collection
+    ? `${collectionFormCount(collection)} forms | ${groups.length} subcollections`
+    : "0 forms";
   if (group) {
     ui.groupSelect.value = String(activeGroupIndex);
     ui.groupRule.textContent = groupRuleLabel(group);
     ui.groupRule.title = `${group.ruleText}${group.missingItems.length ? `\nMissing: ${group.missingItems.join(", ")}` : ""}`;
   } else {
-    ui.groupRule.textContent = "No group selected";
+    ui.groupRule.textContent = "No subcollection selected";
     ui.groupRule.title = "";
   }
 }
@@ -2094,15 +2433,18 @@ function setGroupAlertDisabled(value) {
   }
 }
 
-function commitGroupChange(index, { selectFirst = true } = {}) {
-  const group = compatibleGroups[index];
+function commitCatalogSelection(collectionIndex, groupIndex, { selectFirst = true } = {}) {
+  const collection = lifeformCollections[collectionIndex];
+  const group = collection?.groups[groupIndex];
   if (!group) return;
-  activeGroupIndex = index;
+  activeCollectionIndex = collectionIndex;
+  activeGroupIndex = groupIndex;
+  pendingCollectionIndex = -1;
   pendingGroupIndex = -1;
   pendingPlacement = null;
   const query = ui.formSearch.value.trim().toLowerCase();
   const firstVisible = group.forms.find((form) => {
-    return !query || `${form.code} ${form.name} ${form.section}`.toLowerCase().includes(query);
+    return !query || formSearchText(form).includes(query);
   });
   if (selectFirst) selectedForm = firstVisible || null;
   applyRuleInfo(group.perFormRule && firstVisible ? firstVisible.ruleInfo : group.ruleInfo);
@@ -2121,37 +2463,58 @@ function commitGroupChange(index, { selectFirst = true } = {}) {
 
 function hideGroupChangeDialog() {
   ui.groupChangeDialog.hidden = true;
+  pendingCollectionIndex = -1;
   pendingGroupIndex = -1;
   ui.skipGroupAlert.checked = false;
+  ui.collectionSelect.value = String(activeCollectionIndex);
   ui.groupSelect.value = String(activeGroupIndex);
 }
 
-function showGroupChangeDialog(index) {
-  const group = compatibleGroups[index];
+function showGroupChangeDialog(collectionIndex, groupIndex) {
+  const collection = lifeformCollections[collectionIndex];
+  const group = collection?.groups[groupIndex];
   if (!group) return;
-  pendingGroupIndex = index;
-  ui.groupChangeMessage.textContent = `Changing to group ${index + 1} updates the field's simulation values to ${groupRuleLabel(group)}. Existing lifeforms may become unstable.`;
+  pendingCollectionIndex = collectionIndex;
+  pendingGroupIndex = groupIndex;
+  ui.groupChangeMessage.textContent = `Changing to ${collection.title} / ${group.title} updates the field's simulation values to ${groupRuleLabel(group)}. Existing lifeforms may become unstable.`;
   ui.groupChangeDialog.hidden = false;
   ui.confirmGroupChangeBtn.focus();
 }
 
-function requestGroupChange(index) {
-  if (index === activeGroupIndex || !compatibleGroups[index]) {
+function requestCatalogSelection(collectionIndex, groupIndex) {
+  const collection = lifeformCollections[collectionIndex];
+  const group = collection?.groups[groupIndex];
+  if (!group) {
+    renderGroupOrganizer();
+    return;
+  }
+
+  if (collectionIndex === activeCollectionIndex && groupIndex === activeGroupIndex) {
     ui.groupSelect.value = String(activeGroupIndex);
     return;
   }
 
   if (activeGroupIndex < 0 || groupAlertDisabled()) {
-    commitGroupChange(index);
+    commitCatalogSelection(collectionIndex, groupIndex);
     return;
   }
 
-  showGroupChangeDialog(index);
+  showGroupChangeDialog(collectionIndex, groupIndex);
+}
+
+function requestCollectionChange(index) {
+  const collection = lifeformCollections[index];
+  requestCatalogSelection(index, defaultGroupIndex(collection));
+}
+
+function requestGroupChange(index) {
+  requestCatalogSelection(activeCollectionIndex, index);
 }
 
 function moveGroup(offset) {
-  if (!compatibleGroups.length) return;
-  const nextIndex = (activeGroupIndex + offset + compatibleGroups.length) % compatibleGroups.length;
+  const groups = collectionGroups();
+  if (!groups.length) return;
+  const nextIndex = (activeGroupIndex + offset + groups.length) % groups.length;
   requestGroupChange(nextIndex);
 }
 
@@ -2442,7 +2805,7 @@ function paintAt(point, tool = currentTool) {
 
   if (tool === "sample") {
     const requestId = ++sampleRequestId;
-    sendBackend("sample", { x: wx, y: wy, channelId: selectedChannelId, scope: metricScope, requestId });
+    sendBackend("sample", { x: wx, y: wy, channelId: selectedChannelId, scope: "selected", requestId });
     return;
   }
 
@@ -2641,8 +3004,13 @@ function startWorker() {
 }
 
 function startBackend({ resetField = true } = {}) {
+  const model = simulationModel();
   const wantsWebgl = backendPreference === "webgl" || backendPreference === "auto";
-  const canTryWebgl = wantsWebgl && window.WebGLLeniaSim && glCanvas;
+  const modelWebglReason = webglUnavailableForModel(model);
+  const canTryWebgl = wantsWebgl && !modelWebglReason && window.WebGLLeniaSim && glCanvas;
+  if (wantsWebgl && modelWebglReason) {
+    webglUnavailableReason = modelWebglReason;
+  }
 
   pendingStepCount = 0;
   workerBusy = false;
@@ -2662,7 +3030,7 @@ function startBackend({ resetField = true } = {}) {
         simTime = 0;
         metrics = { mass: 0, growth: 0, energy: 0 };
       }
-      webglSim.init(worldWidth, worldHeight, simulationModel());
+      webglSim.init(worldWidth, worldHeight, model);
       profile = { ...profile, ...webglSim.profile };
       workerReady = false;
       resetRenderBuffer();
@@ -2744,8 +3112,14 @@ function bindEvents() {
   ui.speedSlider.addEventListener("input", syncLabels);
 
   ui.worldSizeSelect.addEventListener("change", () => {
+    if (ui.worldSizeSelect.value === "custom") {
+      syncWorldSizeControl(worldWidth, worldHeight, { forceCustom: true });
+      return;
+    }
     resizeWorld(Number(ui.worldSizeSelect.value));
   });
+  ui.customWorldWidth?.addEventListener("change", resizeFromCustomWorldSize);
+  ui.customWorldHeight?.addEventListener("change", resizeFromCustomWorldSize);
 
   ui.backendSelect.addEventListener("change", () => {
     backendPreference = ui.backendSelect.value;
@@ -2834,16 +3208,18 @@ function bindEvents() {
     });
   }
   ui.formSearch.addEventListener("input", renderFormList);
+  ui.collectionSelect.addEventListener("change", () => requestCollectionChange(Number(ui.collectionSelect.value)));
   ui.groupSelect.addEventListener("change", () => requestGroupChange(Number(ui.groupSelect.value)));
   ui.prevGroupBtn.addEventListener("click", () => moveGroup(-1));
   ui.nextGroupBtn.addEventListener("click", () => moveGroup(1));
   ui.cancelGroupChangeBtn.addEventListener("click", hideGroupChangeDialog);
   ui.confirmGroupChangeBtn.addEventListener("click", () => {
-    const index = pendingGroupIndex;
+    const collectionIndex = pendingCollectionIndex;
+    const groupIndex = pendingGroupIndex;
     setGroupAlertDisabled(ui.skipGroupAlert.checked);
     ui.groupChangeDialog.hidden = true;
     ui.skipGroupAlert.checked = false;
-    commitGroupChange(index);
+    commitCatalogSelection(collectionIndex, groupIndex);
   });
   ui.groupChangeDialog.addEventListener("click", (event) => {
     if (event.target === ui.groupChangeDialog) hideGroupChangeDialog();
@@ -2954,27 +3330,29 @@ function tick(now) {
 
 async function boot() {
   makeBuffers();
+  syncWorldSizeControl(worldWidth);
   resizeCanvas();
   bindEvents();
-  compatibleForms = buildLibraryForms();
+  const baseForms = buildLibraryForms(baseLifeformSources());
+  const repositoryForms = buildLibraryForms(repositoryLifeformSources());
+  catalogForms = [...baseForms, ...repositoryForms];
+  let strictGroups = [];
   try {
-    compatibleGroups = await buildCompatibleGroups(compatibleForms);
+    strictGroups = await buildCompatibleGroups(baseForms);
   } catch (error) {
     console.error(error);
-    compatibleGroups = [];
   }
-  const legacyGroup = buildLegacyCompatibleGroup(compatibleForms);
-  if (legacyGroup) compatibleGroups.push(legacyGroup);
-  const groupFormCount = compatibleGroups.reduce((total, group) => total + group.forms.length, 0);
-  ui.libraryCount.textContent = `${groupFormCount} forms | ${compatibleGroups.length} groups`;
+  const legacyGroup = buildLegacyCompatibleGroup(baseForms);
+  lifeformCollections = buildLifeformCollections(strictGroups, legacyGroup, repositoryForms);
   renderGroupOrganizer();
-  if (compatibleGroups.length) {
-    const groupIndex = defaultGroupIndex();
-    const defaultForm = defaultFormForGroup(compatibleGroups[groupIndex]);
-    commitGroupChange(groupIndex, { selectFirst: false });
+  if (lifeformCollections.length) {
+    const collectionIndex = defaultCollectionIndex();
+    const groupIndex = defaultGroupIndex(lifeformCollections[collectionIndex]);
+    const defaultForm = defaultFormForGroup(lifeformCollections[collectionIndex].groups[groupIndex]);
+    commitCatalogSelection(collectionIndex, groupIndex, { selectFirst: false });
     if (defaultForm) selectForm(defaultForm);
   } else {
-    ui.selectedForm.textContent = "No compatible groups loaded";
+    ui.selectedForm.textContent = "No lifeform collections loaded";
     renderFormList();
   }
   setGameZoom(Number(ui.gameZoomSlider.value));

@@ -1,0 +1,227 @@
+{
+  "type": "leniency-map",
+  "name": "Interacting Layers",
+  "version": 2,
+  "savedAt": "2026-07-09T00:00:00.000Z",
+  "world": {
+    "width": 128,
+    "height": 128
+  },
+  "configuration": {
+    "speed": 12,
+    "backendPreference": "cpu",
+    "activeBackend": "cpu",
+    "rule": {
+      "id": "rule-channel-1-feeds-channel-0",
+      "src": "channel-1",
+      "dst": "channel-0",
+      "sourceChannelId": "channel-1",
+      "destinationChannelId": "channel-0",
+      "radius": 13,
+      "alpha": 4,
+      "mu": 0.15,
+      "sigma": 0.017,
+      "dt": 0.1,
+      "gain": 1,
+      "decay": 0,
+      "limitValue": true,
+      "wrapAround": true,
+      "deltaName": "gaus",
+      "coreName": "bump4",
+      "layer": 0,
+      "beta": [1, 0, 0, 0],
+      "eta": [0, 0, 0, 0],
+      "weight": 0.16,
+      "positiveOnly": true
+    },
+    "layers": {
+      "selectedChannelId": "channel-1",
+      "metricScope": "selected",
+      "wrapAround": true,
+      "channels": [
+        {
+          "id": "channel-0",
+          "name": "Layer 1",
+          "visible": true,
+          "palette": ["#080618", "#231c49", "#3e3f77", "#8889bc", "#f0efd6"]
+        },
+        {
+          "id": "channel-1",
+          "name": "Feeder Layer",
+          "visible": true,
+          "palette": ["#140704", "#4c160b", "#a23a16", "#e98331", "#ffe0a3"]
+        }
+      ],
+      "rules": [
+        {
+          "id": "rule-channel-0",
+          "src": "channel-0",
+          "dst": "channel-0",
+          "sourceChannelId": "channel-0",
+          "destinationChannelId": "channel-0",
+          "radius": 13,
+          "alpha": 4,
+          "mu": 0.15,
+          "sigma": 0.017,
+          "dt": 0.1,
+          "gain": 1,
+          "decay": 0,
+          "limitValue": true,
+          "deltaName": "gaus",
+          "coreName": "bump4",
+          "layer": 0,
+          "beta": [1, 0, 0, 0],
+          "eta": [0, 0, 0, 0],
+          "weight": 1,
+          "positiveOnly": false
+        },
+        {
+          "id": "rule-channel-1",
+          "src": "channel-1",
+          "dst": "channel-1",
+          "sourceChannelId": "channel-1",
+          "destinationChannelId": "channel-1",
+          "radius": 13,
+          "alpha": 4,
+          "mu": 0.15,
+          "sigma": 0.017,
+          "dt": 0.1,
+          "gain": 1,
+          "decay": 0,
+          "limitValue": true,
+          "deltaName": "gaus",
+          "coreName": "bump4",
+          "layer": 0,
+          "beta": [1, 0, 0, 0],
+          "eta": [0, 0, 0, 0],
+          "weight": 1,
+          "positiveOnly": false
+        },
+        {
+          "id": "rule-channel-1-feeds-channel-0",
+          "src": "channel-1",
+          "dst": "channel-0",
+          "sourceChannelId": "channel-1",
+          "destinationChannelId": "channel-0",
+          "radius": 13,
+          "alpha": 4,
+          "mu": 0.15,
+          "sigma": 0.017,
+          "dt": 0.1,
+          "gain": 1,
+          "decay": 0,
+          "limitValue": true,
+          "deltaName": "gaus",
+          "coreName": "bump4",
+          "layer": 0,
+          "beta": [1, 0, 0, 0],
+          "eta": [0, 0, 0, 0],
+          "weight": 0.16,
+          "positiveOnly": true
+        },
+        {
+          "id": "rule-channel-0-feeds-channel-1",
+          "src": "channel-0",
+          "dst": "channel-1",
+          "sourceChannelId": "channel-0",
+          "destinationChannelId": "channel-1",
+          "radius": 13,
+          "alpha": 4,
+          "mu": 0.15,
+          "sigma": 0.017,
+          "dt": 0.1,
+          "gain": 1,
+          "decay": 0,
+          "limitValue": true,
+          "deltaName": "gaus",
+          "coreName": "bump4",
+          "layer": 0,
+          "beta": [1, 0, 0, 0],
+          "eta": [0, 0, 0, 0],
+          "weight": 0.12,
+          "positiveOnly": true
+        }
+      ]
+    },
+    "advanced": {
+      "safe": 64,
+      "colors": ["#080618", "#231c49", "#3e3f77", "#8889bc", "#f0efd6"]
+    },
+    "brush": {
+      "size": 3,
+      "power": 0.15
+    },
+    "game": {
+      "background": "stars",
+      "starDensity": 55,
+      "starSpeed": 1,
+      "starBrightness": 0.6,
+      "accel": 175,
+      "maxSpeed": 36,
+      "friction": 3.2,
+      "mouseSensitivity": 0.025,
+      "brushInterval": 30,
+      "cameraCenterPull": 0.35,
+      "cameraEdgePull": 5.2,
+      "cameraInnerZone": 0.28,
+      "cameraEdgeZone": 0.86,
+      "cameraGuardZone": 0.94,
+      "zoom": 18,
+      "minZoom": 6,
+      "maxZoom": 36
+    },
+    "state": {
+      "simTime": 0,
+      "isRunning": false,
+      "gameMode": false,
+      "currentTool": "paint",
+      "metrics": {
+        "mass": 0,
+        "growth": 0,
+        "energy": 0
+      }
+    },
+    "camera": {
+      "x": 64,
+      "y": 64,
+      "scale": 6
+    },
+    "gamePlayer": {
+      "x": 64,
+      "y": 64,
+      "vx": 0,
+      "vy": 0,
+      "initialized": false
+    },
+    "library": {
+      "activeGroupIndex": -1,
+      "groupId": null,
+      "groupTitle": null,
+      "groupRule": null,
+      "selectedForm": null
+    },
+    "pendingPlacement": null
+  },
+  "fields": [
+    {
+      "channelId": "channel-0",
+      "encoding": "float32-base64",
+      "littleEndian": true,
+      "length": 16384,
+      "data": ""
+    },
+    {
+      "channelId": "channel-1",
+      "encoding": "float32-base64",
+      "littleEndian": true,
+      "length": 16384,
+      "data": ""
+    }
+  ],
+  "field": {
+    "encoding": "float32-base64",
+    "littleEndian": true,
+    "length": 16384,
+    "data": ""
+  }
+}

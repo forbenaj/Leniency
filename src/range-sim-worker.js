@@ -1,6 +1,7 @@
 const CHUNK_SIZE = 32;
 const EPSILON = 0.00001;
 const GROWTH_LUT_SIZE = 4096;
+const MAX_CHANNELS = 3;
 const DEFAULT_COLORS = ["#080618", "#231c49", "#3e3f77", "#8889bc", "#f0efd6"];
 const DEFAULT_RULE = {
   id: "rule-0",
@@ -19,6 +20,8 @@ const DEFAULT_RULE = {
   layer: 0,
   beta: [1, 0, 0, 0],
   eta: [0, 0, 0, 0],
+  weight: 1,
+  positiveOnly: false,
 };
 
 let worldWidth = 768;
@@ -158,7 +161,7 @@ function setModel(nextModel = {}) {
 
 function normalizeModel(model = {}) {
   const sourceChannels = Array.isArray(model.channels) && model.channels.length ? model.channels : legacyModel(model).channels;
-  const normalizedChannels = sourceChannels.map((channel, index) => ({
+  const normalizedChannels = sourceChannels.slice(0, MAX_CHANNELS).map((channel, index) => ({
     id: String(channel.id || `channel-${index}`),
     name: String(channel.name || `Layer ${index + 1}`),
     palette: normalizePalette(channel.palette || channel.colors || (index === 0 ? DEFAULT_COLORS : DEFAULT_COLORS)),
@@ -168,11 +171,13 @@ function normalizeModel(model = {}) {
   const sourceRules = Array.isArray(model.rules) && model.rules.length ? model.rules : [model.rule || DEFAULT_RULE];
   const normalizedRules = sourceRules.map((rule, index) => {
     const fallbackId = normalizedChannels[0]?.id || "channel-0";
+    const sourceId = String(rule.sourceChannelId || rule.src || rule.source || fallbackId);
+    const destinationId = String(rule.destinationChannelId || rule.dst || rule.destination || fallbackId);
     return normalizeRule({
       ...rule,
       id: rule.id || `rule-${index}`,
-      sourceChannelId: ids.has(String(rule.sourceChannelId)) ? String(rule.sourceChannelId) : fallbackId,
-      destinationChannelId: ids.has(String(rule.destinationChannelId)) ? String(rule.destinationChannelId) : fallbackId,
+      sourceChannelId: ids.has(sourceId) ? sourceId : fallbackId,
+      destinationChannelId: ids.has(destinationId) ? destinationId : fallbackId,
     });
   });
   return {
@@ -202,6 +207,8 @@ function normalizeRule(rule = {}) {
     layer: Number(rule.layer || 0),
     beta: [...(rule.beta || [1, 0, 0, 0])],
     eta: [...(rule.eta || [0, 0, 0, 0])],
+    weight: Number(rule.weight ?? 1),
+    positiveOnly: Boolean(rule.positiveOnly),
     kernelOx: new Int16Array(0),
     kernelOy: new Int16Array(0),
     kernelOffset: new Int32Array(0),
@@ -421,7 +428,9 @@ function sampleAt(x, y, channelId, scope, requestId) {
   if (x >= 0 && x < worldWidth && y >= 0 && y < worldHeight) {
     const index = y * worldWidth + x;
     if (scope === "aggregate") {
-      for (const channel of channels) value += channel.field[index] || 0;
+      for (const channel of channels) {
+        if (channel.visible !== false) value += channel.field[index] || 0;
+      }
       value = clamp(value);
     } else {
       const channel = channelMap.get(channelId) || channelMap.get(selectedChannelId) || channels[0];
@@ -521,18 +530,48 @@ function stepOnce(safeRect) {
   let dirtyChunks = new Set();
   let simChunks = new Set();
   const growthTotals = new Map();
+  const initializedDestinations = new Set();
+  const destinationChunks = new Map();
+  const destinationRules = new Map();
 
   for (const rule of rules) {
     const source = channelMap.get(rule.sourceChannelId);
     const dest = channelMap.get(rule.destinationChannelId);
     if (!source || !dest) continue;
     const ruleChunks = buildSimulationChunks(activeBefore.get(source.id) || new Set(), safeRect, rule);
+    if (!ruleChunks.size) continue;
     simChunks = unionSets(simChunks, ruleChunks);
-    dirtyChunks = unionSets(dirtyChunks, unionSets(ruleChunks, touchedBefore.get(dest.id) || new Set()));
-    applyRule(rule, source, dest, ruleChunks, safeRect, growthTotals);
+    if (!initializedDestinations.has(dest.id)) {
+      dest.next.set(dest.field);
+      initializedDestinations.add(dest.id);
+    }
+    destinationChunks.set(dest.id, unionSets(destinationChunks.get(dest.id) || new Set(), ruleChunks));
+    const ruleList = destinationRules.get(dest.id) || [];
+    ruleList.push(rule);
+    destinationRules.set(dest.id, ruleList);
+    applyRuleContribution(rule, source, dest, ruleChunks, safeRect, growthTotals);
+  }
+
+  for (const channelId of initializedDestinations) {
+    const dest = channelMap.get(channelId);
+    if (!dest) continue;
+    const changedChunks = destinationChunks.get(channelId) || new Set();
+    const touchedChunks = touchedBefore.get(channelId) || new Set();
+    const finalChunks = unionSets(changedChunks, touchedChunks);
+    dirtyChunks = unionSets(dirtyChunks, finalChunks);
+    finalizeDestination(dest, finalChunks, destinationRules.get(channelId) || [], safeRect);
     [dest.field, dest.next] = [dest.next, dest.field];
-    dest.fieldTouchedChunks = new Set(ruleChunks);
-    rebuildChunkActivity(dest, unionSets(ruleChunks, touchedBefore.get(dest.id) || new Set()));
+    dest.fieldTouchedChunks = new Set(changedChunks);
+    rebuildChunkActivity(dest, finalChunks);
+  }
+
+  for (const channel of channels) {
+    if (initializedDestinations.has(channel.id)) continue;
+    const touchedChunks = touchedBefore.get(channel.id) || new Set();
+    if (!touchedChunks.size) continue;
+    dirtyChunks = unionSets(dirtyChunks, touchedChunks);
+    channel.fieldTouchedChunks.clear();
+    rebuildChunkActivity(channel, touchedChunks);
   }
 
   lastGrowthByChannel = new Map();
@@ -547,9 +586,9 @@ function stepOnce(safeRect) {
   return { dirtyChunks, simChunks: simChunks.size };
 }
 
-function applyRule(rule, source, dest, simChunks, safeRect, growthTotals) {
-  dest.next.set(dest.field);
+function applyRuleContribution(rule, source, dest, simChunks, safeRect, growthTotals) {
   let growthTotal = growthTotals.get(dest.id) || 0;
+  const weight = Number.isFinite(rule.weight) ? rule.weight : 1;
   for (const chunkId of simChunks) {
     const bounds = intersectRects(chunkBounds(chunkId), safeRect);
     if (!bounds) continue;
@@ -578,14 +617,31 @@ function applyRule(rule, source, dest, simChunks, safeRect, growthTotals) {
         }
 
         const current = dest.field[index];
-        const growth = growthFromLut(rule, neighborhood) * rule.gain;
-        growthTotal += growth;
-        const rawValue = current + rule.dt * growth - rule.decay * current;
-        dest.next[index] = isDiscreteRule(rule) ? (rawValue > 0.5 ? 1 : 0) : rule.limitValue ? clamp(rawValue) : Math.max(0, rawValue);
+        const rawGrowth = growthFromLut(rule, neighborhood) * rule.gain;
+        const growth = rule.positiveOnly ? Math.max(0, rawGrowth) : rawGrowth;
+        growthTotal += growth * weight;
+        dest.next[index] += rule.dt * growth * weight - rule.decay * current;
       }
     }
   }
   growthTotals.set(dest.id, growthTotal);
+}
+
+function finalizeDestination(channel, chunks, rulesForChannel, safeRect) {
+  const discrete = rulesForChannel.some(isDiscreteRule);
+  const shouldLimit = rulesForChannel.every((rule) => rule.limitValue !== false);
+  for (const chunkId of chunks) {
+    const bounds = intersectRects(chunkBounds(chunkId), safeRect);
+    if (!bounds) continue;
+    for (let y = bounds.top; y < bounds.bottom; y += 1) {
+      const row = y * worldWidth;
+      for (let x = bounds.left; x < bounds.right; x += 1) {
+        const index = row + x;
+        const value = channel.next[index];
+        channel.next[index] = discrete ? (value > 0.5 ? 1 : 0) : shouldLimit ? clamp(value) : Math.max(0, value);
+      }
+    }
+  }
 }
 
 function buildSimulationChunks(sourceChunks, safeRect, rule) {
@@ -665,12 +721,14 @@ function measureMetrics() {
       energy: energy / channel.field.length,
     };
     perChannel[channel.id] = nextMetrics;
-    aggregateMass += nextMetrics.mass;
-    aggregateEnergy += nextMetrics.energy;
+    if (channel.visible !== false) {
+      aggregateMass += nextMetrics.mass;
+      aggregateEnergy += nextMetrics.energy;
+    }
   }
   const aggregate = {
     mass: aggregateMass,
-    growth: Object.values(perChannel).reduce((sum, item) => sum + item.growth, 0),
+    growth: channels.reduce((sum, channel) => (channel.visible === false ? sum : sum + (perChannel[channel.id]?.growth || 0)), 0),
     energy: aggregateEnergy,
   };
   metrics = {

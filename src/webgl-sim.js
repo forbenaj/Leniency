@@ -1,6 +1,8 @@
 (function () {
   const EPSILON = 0.00001;
-  const MAX_RENDER_CHANNELS = 8;
+  const MAX_CHANNELS = 3;
+  const MAX_RENDER_CHANNELS = MAX_CHANNELS;
+  const MAX_RULES = 8;
   const DEFAULT_COLORS = ["#080618", "#231c49", "#3e3f77", "#8889bc", "#f0efd6"];
   const DEFAULT_RULE = {
     id: "rule-0",
@@ -20,6 +22,8 @@
     layer: 0,
     beta: [1, 0, 0, 0],
     eta: [0, 0, 0, 0],
+    weight: 1,
+    positiveOnly: false,
   };
 
   class WebGLLeniaSim {
@@ -63,12 +67,20 @@
       this.renderProgram = createProgram(gl, VERTEX_SHADER, RENDER_FRAGMENT_SHADER);
       this.brushProgram = createProgram(gl, VERTEX_SHADER, BRUSH_FRAGMENT_SHADER);
       this.placeProgram = createProgram(gl, VERTEX_SHADER, PLACE_FRAGMENT_SHADER);
+      this.randomizeProgram = createProgram(gl, VERTEX_SHADER, RANDOMIZE_FRAGMENT_SHADER);
       this.copyProgram = createProgram(gl, VERTEX_SHADER, COPY_FRAGMENT_SHADER);
       this.clearProgram = createProgram(gl, VERTEX_SHADER, CLEAR_FRAGMENT_SHADER);
       this.quantizeProgram = createProgram(gl, VERTEX_SHADER, QUANTIZE_FRAGMENT_SHADER);
-      this.emptyTexture = null;
+      this.remapProgram = createProgram(gl, VERTEX_SHADER, REMAP_FRAGMENT_SHADER);
+
+      this.stateTextures = [];
+      this.stateFramebuffers = [];
+      this.sourceIndex = 0;
+      this.emptyKernelTexture = null;
+
       this.testFloatFramebuffer();
-      this.emptyTexture = this.createFieldTexture(1, 1);
+      this.replaceStateTextures(1, 1);
+      this.emptyKernelTexture = this.createKernelTexture(new Float32Array([0, 0, 0, 0]), 1);
     }
 
     static isSupported(canvas) {
@@ -84,25 +96,28 @@
     init(width, height, modelOrConfig, colors) {
       this.width = Math.max(1, Math.floor(width || 1));
       this.height = Math.max(1, Math.floor(height || 1));
+      this.replaceStateTextures(this.width, this.height);
       this.setModel(modelOrConfig?.channels ? modelOrConfig : legacyModel(modelOrConfig, colors), { preserve: false });
       this.clear();
     }
 
     dispose() {
       const gl = this.gl;
-      for (const channel of this.channels) deleteChannel(gl, channel);
+      this.deleteStateTextures();
       for (const rule of this.rules) {
         if (rule.kernelTexture) gl.deleteTexture(rule.kernelTexture);
       }
-      if (this.emptyTexture) gl.deleteTexture(this.emptyTexture);
+      if (this.emptyKernelTexture) gl.deleteTexture(this.emptyKernelTexture);
       for (const program of [
         this.stepProgram,
         this.renderProgram,
         this.brushProgram,
         this.placeProgram,
+        this.randomizeProgram,
         this.copyProgram,
         this.clearProgram,
         this.quantizeProgram,
+        this.remapProgram,
       ]) {
         if (program) gl.deleteProgram(program);
       }
@@ -119,25 +134,28 @@
 
     setModel(model, { preserve = true } = {}) {
       const normalized = normalizeModel(model);
+      if (normalized.rules.length > MAX_RULES) {
+        throw new Error(`WebGL v1 supports up to ${MAX_RULES} rules`);
+      }
+
       const gl = this.gl;
-      const previous = this.channelMap;
-      const nextChannels = [];
-      const nextMap = new Map();
+      const previousChannels = this.channels;
+      const previousById = new Map(previousChannels.map((channel) => [channel.id, channel]));
+      const nextChannels = normalized.channels.map((info, index) => ({
+        id: info.id,
+        name: info.name,
+        visible: info.visible,
+        palette: info.palette,
+        componentIndex: index,
+      }));
+      const nextMap = new Map(nextChannels.map((channel) => [channel.id, channel]));
+      const remap = nextChannels.map((channel) => previousById.get(channel.id)?.componentIndex ?? -1);
+      const needsRemap =
+        preserve &&
+        previousChannels.length > 0 &&
+        (nextChannels.length !== previousChannels.length ||
+          nextChannels.some((channel, index) => previousChannels[index]?.id !== channel.id));
 
-      for (const info of normalized.channels) {
-        let channel = preserve ? previous.get(info.id) : null;
-        if (!channel) channel = this.createChannel(info);
-        channel.id = info.id;
-        channel.name = info.name;
-        channel.visible = info.visible;
-        channel.palette = info.palette;
-        nextChannels.push(channel);
-        nextMap.set(channel.id, channel);
-      }
-
-      for (const oldChannel of this.channels) {
-        if (!nextMap.has(oldChannel.id)) deleteChannel(gl, oldChannel);
-      }
       for (const rule of this.rules) {
         if (rule.kernelTexture) gl.deleteTexture(rule.kernelTexture);
       }
@@ -153,10 +171,17 @@
       if (!this.rules.length && this.channels.length) {
         this.rules = [normalizeRule({ sourceChannelId: this.channels[0].id, destinationChannelId: this.channels[0].id })];
       }
+      if (this.rules.length > MAX_RULES) {
+        throw new Error(`WebGL v1 supports up to ${MAX_RULES} rules`);
+      }
+
       for (const rule of this.rules) this.rebuildKernel(rule);
+      if (needsRemap) this.remapState(remap);
+      if (!preserve) this.clearStateTextures();
       for (const channel of this.channels) {
         if (isDiscreteChannel(this.rules, channel.id)) this.quantizeChannel(channel);
       }
+      this.metrics = emptyMetrics(this.selectedChannelId, this.metricScope);
       this.markFullSimulation();
     }
 
@@ -169,41 +194,43 @@
     resize(width, height) {
       const oldWidth = this.width;
       const oldHeight = this.height;
+      const oldTextures = this.stateTextures;
+      const oldFramebuffers = this.stateFramebuffers;
+      const oldTexture = this.sourceTexture();
+
       this.width = Math.max(1, Math.floor(width || 1));
       this.height = Math.max(1, Math.floor(height || 1));
+      this.stateTextures = [this.createFieldTexture(this.width, this.height), this.createFieldTexture(this.width, this.height)];
+      this.stateFramebuffers = this.stateTextures.map((texture) => this.createFramebuffer(texture));
+      this.sourceIndex = 0;
+
+      const copyWidth = Math.min(oldWidth, this.width);
+      const copyHeight = Math.min(oldHeight, this.height);
+      const oldX = Math.floor((oldWidth - copyWidth) / 2);
+      const oldY = Math.floor((oldHeight - copyHeight) / 2);
+      const newX = Math.floor((this.width - copyWidth) / 2);
+      const newY = Math.floor((this.height - copyHeight) / 2);
+      this.runCopyPass(oldTexture, oldWidth, oldHeight, oldX, oldY, newX, newY, copyWidth, copyHeight);
+      this.clearTexture(this.destinationTexture(), this.destinationFramebuffer());
+
       const gl = this.gl;
-
-      for (const channel of this.channels) {
-        const oldTextures = channel.textures;
-        const oldFramebuffers = channel.framebuffers;
-        const oldTexture = sourceTexture(channel);
-        channel.textures = [this.createFieldTexture(this.width, this.height), this.createFieldTexture(this.width, this.height)];
-        channel.framebuffers = channel.textures.map((texture) => this.createFramebuffer(texture));
-        channel.sourceIndex = 0;
-
-        const copyWidth = Math.min(oldWidth, this.width);
-        const copyHeight = Math.min(oldHeight, this.height);
-        const oldX = Math.floor((oldWidth - copyWidth) / 2);
-        const oldY = Math.floor((oldHeight - copyHeight) / 2);
-        const newX = Math.floor((this.width - copyWidth) / 2);
-        const newY = Math.floor((this.height - copyHeight) / 2);
-        this.runCopyPass(channel, oldTexture, oldWidth, oldHeight, oldX, oldY, newX, newY, copyWidth, copyHeight);
-        this.clearTexture(channel.textures[1], channel.framebuffers[1]);
-
-        for (const texture of oldTextures) gl.deleteTexture(texture);
-        for (const framebuffer of oldFramebuffers) gl.deleteFramebuffer(framebuffer);
-      }
+      for (const texture of oldTextures) gl.deleteTexture(texture);
+      for (const framebuffer of oldFramebuffers) gl.deleteFramebuffer(framebuffer);
       for (const rule of this.rules) this.rebuildKernel(rule);
       this.metrics = emptyMetrics(this.selectedChannelId, this.metricScope);
       this.markFullSimulation();
     }
 
     clear(channelId = null) {
-      for (const channel of this.channels) {
-        if (channelId && channel.id !== channelId) continue;
-        this.clearTexture(channel.textures[0], channel.framebuffers[0]);
-        this.clearTexture(channel.textures[1], channel.framebuffers[1]);
-        channel.sourceIndex = 0;
+      if (channelId == null) {
+        this.clearStateTextures();
+      } else {
+        const channel = this.channelMap.get(channelId) || this.channelMap.get(this.selectedChannelId) || this.channels[0];
+        if (!channel) return;
+        this.runEditProgram(this.clearProgram, (gl, program) => {
+          bindTexture(gl, program, "uState", this.sourceTexture(), 0);
+          gl.uniform1i(gl.getUniformLocation(program, "uTargetChannel"), channel.componentIndex);
+        });
       }
       this.metrics = emptyMetrics(this.selectedChannelId, this.metricScope);
       this.profile = { ...this.profile, activeChunks: 0, simChunks: 0, patches: 0 };
@@ -212,27 +239,22 @@
     randomize(rect, channelId = this.selectedChannelId) {
       const channel = this.channelMap.get(channelId) || this.channelMap.get(this.selectedChannelId) || this.channels[0];
       if (!channel) return;
-      const data = new Float32Array(this.width * this.height);
       const safeRect = normalizeRect(rect, this.width, this.height);
-      const discrete = isDiscreteChannel(this.rules, channel.id);
-      for (let y = safeRect.top; y < safeRect.bottom; y += 1) {
-        const row = y * this.width;
-        for (let x = safeRect.left; x < safeRect.right; x += 1) {
-          if (Math.random() > 0.86) data[row + x] = discrete ? 1 : Math.random();
-        }
-      }
-      const gl = this.gl;
-      gl.bindTexture(gl.TEXTURE_2D, sourceTexture(channel));
-      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, this.width, this.height, gl.RED, gl.FLOAT, data);
-      this.clearTexture(destinationTexture(channel), destinationFramebuffer(channel));
+      this.runEditProgram(this.randomizeProgram, (gl, program) => {
+        bindTexture(gl, program, "uState", this.sourceTexture(), 0);
+        gl.uniform4f(gl.getUniformLocation(program, "uRect"), safeRect.left, safeRect.top, safeRect.right, safeRect.bottom);
+        gl.uniform1f(gl.getUniformLocation(program, "uSeed"), performance.now() + Math.random() * 1000);
+        gl.uniform1i(gl.getUniformLocation(program, "uTargetChannel"), channel.componentIndex);
+        gl.uniform1i(gl.getUniformLocation(program, "uDiscrete"), isDiscreteChannel(this.rules, channel.id) ? 1 : 0);
+      });
       this.markFullSimulation();
     }
 
     brush({ x, y, radius, power, mode, channelId }) {
       const channel = this.channelMap.get(channelId) || this.channelMap.get(this.selectedChannelId) || this.channels[0];
       if (!channel) return;
-      this.runEditProgram(channel, this.brushProgram, (gl, program) => {
-        bindTexture(gl, program, "uField", sourceTexture(channel), 0);
+      this.runEditProgram(this.brushProgram, (gl, program) => {
+        bindTexture(gl, program, "uState", this.sourceTexture(), 0);
         gl.uniform2f(gl.getUniformLocation(program, "uWorldSize"), this.width, this.height);
         gl.uniform2f(gl.getUniformLocation(program, "uCenter"), x, y);
         gl.uniform1f(gl.getUniformLocation(program, "uRadius"), Math.max(0, radius ?? 0));
@@ -240,6 +262,7 @@
         gl.uniform1i(gl.getUniformLocation(program, "uMode"), mode === "erase" ? 1 : 0);
         gl.uniform1i(gl.getUniformLocation(program, "uWrap"), this.wrapAround ? 1 : 0);
         gl.uniform1i(gl.getUniformLocation(program, "uDiscrete"), isDiscreteChannel(this.rules, channel.id) ? 1 : 0);
+        gl.uniform1i(gl.getUniformLocation(program, "uTargetChannel"), channel.componentIndex);
       });
       this.markFullSimulation();
     }
@@ -259,8 +282,8 @@
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, placement.width, placement.height, 0, gl.RED, gl.FLOAT, placement.cells);
 
-      this.runEditProgram(channel, this.placeProgram, (nextGl, program) => {
-        bindTexture(nextGl, program, "uField", sourceTexture(channel), 0);
+      this.runEditProgram(this.placeProgram, (nextGl, program) => {
+        bindTexture(nextGl, program, "uState", this.sourceTexture(), 0);
         bindTexture(nextGl, program, "uCells", cellTexture, 1);
         nextGl.uniform2f(nextGl.getUniformLocation(program, "uWorldSize"), this.width, this.height);
         nextGl.uniform2f(nextGl.getUniformLocation(program, "uCenter"), placement.x, placement.y);
@@ -269,6 +292,7 @@
         nextGl.uniform1f(nextGl.getUniformLocation(program, "uAngle"), placement.angle || 0);
         nextGl.uniform1i(nextGl.getUniformLocation(program, "uWrap"), this.wrapAround ? 1 : 0);
         nextGl.uniform1i(nextGl.getUniformLocation(program, "uDiscrete"), isDiscreteChannel(this.rules, channel.id) ? 1 : 0);
+        nextGl.uniform1i(nextGl.getUniformLocation(program, "uTargetChannel"), channel.componentIndex);
       });
       gl.deleteTexture(cellTexture);
       this.markFullSimulation();
@@ -276,16 +300,20 @@
 
     sample(x, y, channelId = this.selectedChannelId, scope = this.metricScope) {
       if (x < 0 || y < 0 || x >= this.width || y >= this.height) return 0;
+      const pixel = this.readPackedPixel(x, y);
       if (scope === "aggregate") {
         let total = 0;
-        for (const channel of this.channels) total += this.readPixel(channel, x, y);
+        for (const channel of this.channels) {
+          if (channel.visible !== false) total += pixel[channel.componentIndex] || 0;
+        }
         return clamp(total);
       }
       const channel = this.channelMap.get(channelId) || this.channelMap.get(this.selectedChannelId) || this.channels[0];
-      return channel ? this.readPixel(channel, x, y) : 0;
+      return channel ? pixel[channel.componentIndex] || 0 : 0;
     }
 
     snapshot() {
+      const packed = this.readPackedState();
       const channels = this.channels.map((channel) => ({
         id: channel.id,
         name: channel.name,
@@ -293,7 +321,7 @@
         palette: [...channel.palette],
         width: this.width,
         height: this.height,
-        values: this.readChannel(channel),
+        values: unpackChannel(packed, channel.componentIndex),
       }));
       return {
         width: this.width,
@@ -307,10 +335,12 @@
       if (snapshot.width && snapshot.height && (snapshot.width !== this.width || snapshot.height !== this.height)) {
         this.width = Math.max(1, Math.floor(snapshot.width));
         this.height = Math.max(1, Math.floor(snapshot.height));
+        this.replaceStateTextures(this.width, this.height);
         this.setModel(snapshot.model || currentModel(this), { preserve: false });
       } else if (snapshot.model) {
         this.setModel(snapshot.model);
       }
+      const packed = new Float32Array(this.width * this.height * 4);
       const incoming = Array.isArray(snapshot.channels)
         ? snapshot.channels
         : [{ id: this.channels[0]?.id || "channel-0", values: snapshot.values }];
@@ -319,11 +349,12 @@
         if (!channel || !item.values) continue;
         const values = item.values instanceof Float32Array ? item.values : new Float32Array(item.values);
         if (values.length !== this.width * this.height) continue;
-        const gl = this.gl;
-        gl.bindTexture(gl.TEXTURE_2D, sourceTexture(channel));
-        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, this.width, this.height, gl.RED, gl.FLOAT, values);
-        this.clearTexture(destinationTexture(channel), destinationFramebuffer(channel));
+        packChannel(packed, values, channel.componentIndex);
       }
+      const gl = this.gl;
+      gl.bindTexture(gl.TEXTURE_2D, this.sourceTexture());
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, this.width, this.height, gl.RGBA, gl.FLOAT, packed);
+      this.clearTexture(this.destinationTexture(), this.destinationFramebuffer());
       this.markFullSimulation();
     }
 
@@ -331,33 +362,40 @@
       const gl = this.gl;
       const stepCount = Math.max(1, Math.min(8, count || 1));
       const start = performance.now();
-      for (let i = 0; i < stepCount; i += 1) {
-        for (const rule of this.rules) {
-          const source = this.channelMap.get(rule.sourceChannelId);
-          const dest = this.channelMap.get(rule.destinationChannelId);
-          if (!source || !dest) continue;
-          gl.useProgram(this.stepProgram);
-          gl.bindFramebuffer(gl.FRAMEBUFFER, destinationFramebuffer(dest));
-          gl.viewport(0, 0, this.width, this.height);
-          bindTexture(gl, this.stepProgram, "uSourceField", sourceTexture(source), 0);
-          bindTexture(gl, this.stepProgram, "uDestField", sourceTexture(dest), 1);
-          bindTexture(gl, this.stepProgram, "uKernel", rule.kernelTexture, 2);
-          gl.uniform2f(gl.getUniformLocation(this.stepProgram, "uWorldSize"), this.width, this.height);
-          gl.uniform1i(gl.getUniformLocation(this.stepProgram, "uKernelCount"), rule.kernelCount);
-          gl.uniform1f(gl.getUniformLocation(this.stepProgram, "uMu"), rule.mu);
-          gl.uniform1f(gl.getUniformLocation(this.stepProgram, "uSigma"), rule.sigma);
-          gl.uniform1f(gl.getUniformLocation(this.stepProgram, "uDt"), rule.dt);
-          gl.uniform1f(gl.getUniformLocation(this.stepProgram, "uGain"), rule.gain);
-          gl.uniform1f(gl.getUniformLocation(this.stepProgram, "uDecay"), rule.decay);
-          gl.uniform1f(gl.getUniformLocation(this.stepProgram, "uAlpha"), rule.alpha);
-          gl.uniform1i(gl.getUniformLocation(this.stepProgram, "uLimit"), rule.limitValue ? 1 : 0);
-          gl.uniform1i(gl.getUniformLocation(this.stepProgram, "uWrap"), this.wrapAround ? 1 : 0);
-          gl.uniform1i(gl.getUniformLocation(this.stepProgram, "uDeltaMode"), deltaMode(rule.deltaName));
-          gl.uniform1i(gl.getUniformLocation(this.stepProgram, "uDiscrete"), isDiscreteRule(rule) ? 1 : 0);
-          gl.drawArrays(gl.TRIANGLES, 0, 3);
-          swap(dest);
-        }
+      const uniforms = this.compileRuleUniforms();
+
+      gl.useProgram(this.stepProgram);
+      gl.uniform2f(gl.getUniformLocation(this.stepProgram, "uWorldSize"), this.width, this.height);
+      gl.uniform1i(gl.getUniformLocation(this.stepProgram, "uRuleCount"), this.rules.length);
+      gl.uniform1i(gl.getUniformLocation(this.stepProgram, "uWrap"), this.wrapAround ? 1 : 0);
+      gl.uniform1iv(gl.getUniformLocation(this.stepProgram, "uRuleSrc"), uniforms.ruleSrc);
+      gl.uniform1iv(gl.getUniformLocation(this.stepProgram, "uRuleDst"), uniforms.ruleDst);
+      gl.uniform1iv(gl.getUniformLocation(this.stepProgram, "uKernelCount"), uniforms.kernelCount);
+      gl.uniform1iv(gl.getUniformLocation(this.stepProgram, "uPositiveOnly"), uniforms.positiveOnly);
+      gl.uniform1iv(gl.getUniformLocation(this.stepProgram, "uDeltaMode"), uniforms.deltaMode);
+      gl.uniform1iv(gl.getUniformLocation(this.stepProgram, "uDestinationActive"), uniforms.destinationActive);
+      gl.uniform1iv(gl.getUniformLocation(this.stepProgram, "uDestinationDiscrete"), uniforms.destinationDiscrete);
+      gl.uniform1iv(gl.getUniformLocation(this.stepProgram, "uDestinationLimit"), uniforms.destinationLimit);
+      gl.uniform1fv(gl.getUniformLocation(this.stepProgram, "uMu"), uniforms.mu);
+      gl.uniform1fv(gl.getUniformLocation(this.stepProgram, "uSigma"), uniforms.sigma);
+      gl.uniform1fv(gl.getUniformLocation(this.stepProgram, "uDt"), uniforms.dt);
+      gl.uniform1fv(gl.getUniformLocation(this.stepProgram, "uGain"), uniforms.gain);
+      gl.uniform1fv(gl.getUniformLocation(this.stepProgram, "uDecay"), uniforms.decay);
+      gl.uniform1fv(gl.getUniformLocation(this.stepProgram, "uWeight"), uniforms.weight);
+      gl.uniform1fv(gl.getUniformLocation(this.stepProgram, "uAlpha"), uniforms.alpha);
+
+      for (let i = 0; i < MAX_RULES; i += 1) {
+        bindTexture(gl, this.stepProgram, `uKernel${i}`, this.rules[i]?.kernelTexture || this.emptyKernelTexture, i + 1);
       }
+
+      for (let i = 0; i < stepCount; i += 1) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.destinationFramebuffer());
+        gl.viewport(0, 0, this.width, this.height);
+        bindTexture(gl, this.stepProgram, "uState", this.sourceTexture(), 0);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+        this.swapState();
+      }
+
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.flush();
       const stepMs = performance.now() - start;
@@ -374,30 +412,33 @@
     readMetrics(now = performance.now(), force = false) {
       if (!force && now - this.lastMetricReadAt < 850) return null;
       this.lastMetricReadAt = now;
+      const packed = this.readPackedState();
       const perChannel = {};
       let aggregateMass = 0;
       let aggregateEnergy = 0;
       for (const channel of this.channels) {
-        const values = this.readChannel(channel);
         let mass = 0;
         let energy = 0;
-        for (let i = 0; i < values.length; i += 1) {
-          const value = values[i];
+        const component = channel.componentIndex;
+        for (let i = 0; i < this.width * this.height; i += 1) {
+          const value = packed[i * 4 + component];
           if (value > EPSILON) mass += value;
           energy += value * value;
         }
         const channelMetrics = {
-          mass: mass / values.length,
+          mass: mass / (this.width * this.height),
           growth: this.metrics.perChannel?.[channel.id]?.growth || 0,
-          energy: energy / values.length,
+          energy: energy / (this.width * this.height),
         };
         perChannel[channel.id] = channelMetrics;
-        aggregateMass += channelMetrics.mass;
-        aggregateEnergy += channelMetrics.energy;
+        if (channel.visible !== false) {
+          aggregateMass += channelMetrics.mass;
+          aggregateEnergy += channelMetrics.energy;
+        }
       }
       const aggregate = {
         mass: aggregateMass,
-        growth: Object.values(perChannel).reduce((sum, item) => sum + item.growth, 0),
+        growth: this.channels.reduce((sum, channel) => (channel.visible === false ? sum : sum + (perChannel[channel.id]?.growth || 0)), 0),
         energy: aggregateEnergy,
       };
       this.metrics = {
@@ -421,35 +462,20 @@
       gl.useProgram(this.renderProgram);
 
       const renderChannels = this.channels.slice(0, MAX_RENDER_CHANNELS);
-      for (let i = 0; i < MAX_RENDER_CHANNELS; i += 1) {
-        const channel = renderChannels[i];
-        bindTexture(gl, this.renderProgram, `uField${i}`, channel ? sourceTexture(channel) : this.emptyTexture, i);
-      }
+      bindTexture(gl, this.renderProgram, "uState", this.sourceTexture(), 0);
       gl.uniform2f(gl.getUniformLocation(this.renderProgram, "uWorldSize"), this.width, this.height);
       gl.uniform2f(gl.getUniformLocation(this.renderProgram, "uCssSize"), cssWidth, cssHeight);
       gl.uniform1f(gl.getUniformLocation(this.renderProgram, "uDpr"), dpr);
       gl.uniform3f(gl.getUniformLocation(this.renderProgram, "uCamera"), camera.x, camera.y, camera.scale);
       gl.uniform1i(gl.getUniformLocation(this.renderProgram, "uWrap"), this.wrapAround ? 1 : 0);
       gl.uniform1i(gl.getUniformLocation(this.renderProgram, "uChannelCount"), renderChannels.length);
+      gl.uniform1iv(gl.getUniformLocation(this.renderProgram, "uChannelComponent"), componentArray(renderChannels));
       gl.uniform1iv(gl.getUniformLocation(this.renderProgram, "uVisible"), visibleArray(renderChannels));
       gl.uniform1iv(gl.getUniformLocation(this.renderProgram, "uPaletteCount"), paletteCountArray(renderChannels));
       gl.uniform3fv(gl.getUniformLocation(this.renderProgram, "uPalettes"), flattenPalettes(renderChannels));
       const bg = hexToRgb(background || this.channels[0]?.palette?.[0] || DEFAULT_COLORS[0]).map((value) => value / 255);
       gl.uniform3f(gl.getUniformLocation(this.renderProgram, "uBackground"), bg[0], bg[1], bg[2]);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
-    }
-
-    createChannel(info) {
-      const textures = [this.createFieldTexture(this.width, this.height), this.createFieldTexture(this.width, this.height)];
-      return {
-        id: info.id,
-        name: info.name,
-        visible: info.visible,
-        palette: info.palette,
-        textures,
-        framebuffers: textures.map((texture) => this.createFramebuffer(texture)),
-        sourceIndex: 0,
-      };
     }
 
     createFieldTexture(width, height) {
@@ -461,7 +487,20 @@
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, width, height, 0, gl.RED, gl.FLOAT, null);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, width, height, 0, gl.RGBA, gl.FLOAT, null);
+      return texture;
+    }
+
+    createKernelTexture(data, count) {
+      const gl = this.gl;
+      const texture = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, Math.max(1, count), 1, 0, gl.RGBA, gl.FLOAT, data);
       return texture;
     }
 
@@ -483,6 +522,12 @@
       gl.viewport(0, 0, this.width, this.height);
       gl.clearBufferfv(gl.COLOR, 0, new Float32Array([0, 0, 0, 0]));
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    }
+
+    clearStateTextures() {
+      this.clearTexture(this.stateTextures[0], this.stateFramebuffers[0]);
+      this.clearTexture(this.stateTextures[1], this.stateFramebuffers[1]);
+      this.sourceIndex = 0;
     }
 
     testFloatFramebuffer() {
@@ -519,40 +564,111 @@
         data[i * 4 + 1] = offsets[i].oy;
         data[i * 4 + 2] = total > 0 ? offsets[i].weight / total : 0;
       }
-      if (!rule.kernelTexture) rule.kernelTexture = gl.createTexture();
-      gl.bindTexture(gl.TEXTURE_2D, rule.kernelTexture);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, Math.max(1, rule.kernelCount), 1, 0, gl.RGBA, gl.FLOAT, data);
+      if (rule.kernelTexture) gl.deleteTexture(rule.kernelTexture);
+      rule.kernelTexture = this.createKernelTexture(data, rule.kernelCount);
     }
 
-    runEditProgram(channel, program, setUniforms) {
+    compileRuleUniforms() {
+      const ruleSrc = new Int32Array(MAX_RULES);
+      const ruleDst = new Int32Array(MAX_RULES);
+      const kernelCount = new Int32Array(MAX_RULES);
+      const positiveOnly = new Int32Array(MAX_RULES);
+      const deltaModes = new Int32Array(MAX_RULES);
+      const mu = new Float32Array(MAX_RULES);
+      const sigma = new Float32Array(MAX_RULES);
+      const dt = new Float32Array(MAX_RULES);
+      const gain = new Float32Array(MAX_RULES);
+      const decay = new Float32Array(MAX_RULES);
+      const weight = new Float32Array(MAX_RULES);
+      const alpha = new Float32Array(MAX_RULES);
+      const destinationActive = new Int32Array(MAX_CHANNELS);
+      const destinationDiscrete = new Int32Array(MAX_CHANNELS);
+      const destinationLimit = new Int32Array(MAX_CHANNELS);
+      destinationLimit.fill(1);
+
+      const rulesByDestination = new Map();
+      for (let i = 0; i < this.rules.length; i += 1) {
+        const rule = this.rules[i];
+        const source = this.channelMap.get(rule.sourceChannelId);
+        const destination = this.channelMap.get(rule.destinationChannelId);
+        if (!source || !destination) continue;
+        ruleSrc[i] = source.componentIndex;
+        ruleDst[i] = destination.componentIndex;
+        kernelCount[i] = rule.kernelCount || 0;
+        positiveOnly[i] = rule.positiveOnly ? 1 : 0;
+        deltaModes[i] = deltaMode(rule.deltaName);
+        mu[i] = rule.mu;
+        sigma[i] = rule.sigma;
+        dt[i] = rule.dt;
+        gain[i] = rule.gain;
+        decay[i] = rule.decay;
+        weight[i] = rule.weight;
+        alpha[i] = rule.alpha;
+        destinationActive[destination.componentIndex] = 1;
+        if (isDiscreteRule(rule)) destinationDiscrete[destination.componentIndex] = 1;
+        const list = rulesByDestination.get(destination.componentIndex) || [];
+        list.push(rule);
+        rulesByDestination.set(destination.componentIndex, list);
+      }
+
+      for (const [component, destinationRules] of rulesByDestination) {
+        destinationLimit[component] = destinationRules.every((rule) => rule.limitValue !== false) ? 1 : 0;
+      }
+
+      return {
+        ruleSrc,
+        ruleDst,
+        kernelCount,
+        positiveOnly,
+        deltaMode: deltaModes,
+        mu,
+        sigma,
+        dt,
+        gain,
+        decay,
+        weight,
+        alpha,
+        destinationActive,
+        destinationDiscrete,
+        destinationLimit,
+      };
+    }
+
+    runEditProgram(program, setUniforms) {
       const gl = this.gl;
       gl.useProgram(program);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, destinationFramebuffer(channel));
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.destinationFramebuffer());
       gl.viewport(0, 0, this.width, this.height);
       setUniforms(gl, program);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-      swap(channel);
+      this.swapState();
     }
 
     quantizeChannel(channel) {
-      this.runEditProgram(channel, this.quantizeProgram, (gl, program) => {
-        bindTexture(gl, program, "uField", sourceTexture(channel), 0);
+      this.runEditProgram(this.quantizeProgram, (gl, program) => {
+        bindTexture(gl, program, "uState", this.sourceTexture(), 0);
+        gl.uniform1i(gl.getUniformLocation(program, "uTargetChannel"), channel.componentIndex);
       });
       this.markFullSimulation();
     }
 
-    runCopyPass(channel, oldTexture, oldWidth, oldHeight, oldX, oldY, newX, newY, copyWidth, copyHeight) {
+    remapState(sourceComponents) {
+      const data = new Int32Array(MAX_CHANNELS);
+      data.fill(-1);
+      for (let i = 0; i < Math.min(MAX_CHANNELS, sourceComponents.length); i += 1) data[i] = sourceComponents[i];
+      this.runEditProgram(this.remapProgram, (gl, program) => {
+        bindTexture(gl, program, "uState", this.sourceTexture(), 0);
+        gl.uniform1iv(gl.getUniformLocation(program, "uSourceComponent"), data);
+      });
+    }
+
+    runCopyPass(oldTexture, oldWidth, oldHeight, oldX, oldY, newX, newY, copyWidth, copyHeight) {
       const gl = this.gl;
       gl.useProgram(this.copyProgram);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, sourceFramebuffer(channel));
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.sourceFramebuffer());
       gl.viewport(0, 0, this.width, this.height);
-      bindTexture(gl, this.copyProgram, "uOldField", oldTexture, 0);
+      bindTexture(gl, this.copyProgram, "uOldState", oldTexture, 0);
       gl.uniform2f(gl.getUniformLocation(this.copyProgram, "uOldSize"), oldWidth, oldHeight);
       gl.uniform2f(gl.getUniformLocation(this.copyProgram, "uNewSize"), this.width, this.height);
       gl.uniform2f(gl.getUniformLocation(this.copyProgram, "uOldOrigin"), oldX, oldY);
@@ -562,20 +678,20 @@
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     }
 
-    readPixel(channel, x, y) {
+    readPackedPixel(x, y) {
       const gl = this.gl;
-      const value = new Float32Array(1);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, sourceFramebuffer(channel));
-      gl.readPixels(x, y, 1, 1, gl.RED, gl.FLOAT, value);
+      const value = new Float32Array(4);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.sourceFramebuffer());
+      gl.readPixels(x, y, 1, 1, gl.RGBA, gl.FLOAT, value);
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-      return value[0] || 0;
+      return value;
     }
 
-    readChannel(channel) {
+    readPackedState() {
       const gl = this.gl;
-      const values = new Float32Array(this.width * this.height);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, sourceFramebuffer(channel));
-      gl.readPixels(0, 0, this.width, this.height, gl.RED, gl.FLOAT, values);
+      const values = new Float32Array(this.width * this.height * 4);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.sourceFramebuffer());
+      gl.readPixels(0, 0, this.width, this.height, gl.RGBA, gl.FLOAT, values);
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       return values;
     }
@@ -587,6 +703,41 @@
       this.profile.patches = 0;
       this.profile.colorizeMs = 0;
       this.profile.updateFieldBufferMs = 0;
+    }
+
+    replaceStateTextures(width, height) {
+      this.deleteStateTextures();
+      this.stateTextures = [this.createFieldTexture(width, height), this.createFieldTexture(width, height)];
+      this.stateFramebuffers = this.stateTextures.map((texture) => this.createFramebuffer(texture));
+      this.sourceIndex = 0;
+    }
+
+    deleteStateTextures() {
+      const gl = this.gl;
+      for (const texture of this.stateTextures || []) gl.deleteTexture(texture);
+      for (const framebuffer of this.stateFramebuffers || []) gl.deleteFramebuffer(framebuffer);
+      this.stateTextures = [];
+      this.stateFramebuffers = [];
+    }
+
+    sourceTexture() {
+      return this.stateTextures[this.sourceIndex];
+    }
+
+    destinationTexture() {
+      return this.stateTextures[1 - this.sourceIndex];
+    }
+
+    sourceFramebuffer() {
+      return this.stateFramebuffers[this.sourceIndex];
+    }
+
+    destinationFramebuffer() {
+      return this.stateFramebuffers[1 - this.sourceIndex];
+    }
+
+    swapState() {
+      this.sourceIndex = 1 - this.sourceIndex;
     }
   }
 
@@ -602,103 +753,169 @@ void main() {
   const STEP_FRAGMENT_SHADER = `#version 300 es
 precision highp float;
 precision highp int;
-uniform sampler2D uSourceField;
-uniform sampler2D uDestField;
-uniform sampler2D uKernel;
+#define MAX_RULES ${MAX_RULES}
+#define MAX_CHANNELS ${MAX_CHANNELS}
+uniform sampler2D uState;
+uniform sampler2D uKernel0;
+uniform sampler2D uKernel1;
+uniform sampler2D uKernel2;
+uniform sampler2D uKernel3;
+uniform sampler2D uKernel4;
+uniform sampler2D uKernel5;
+uniform sampler2D uKernel6;
+uniform sampler2D uKernel7;
 uniform vec2 uWorldSize;
-uniform int uKernelCount;
-uniform float uMu;
-uniform float uSigma;
-uniform float uDt;
-uniform float uGain;
-uniform float uDecay;
-uniform float uAlpha;
-uniform bool uLimit;
+uniform int uRuleCount;
+uniform int uRuleSrc[MAX_RULES];
+uniform int uRuleDst[MAX_RULES];
+uniform int uKernelCount[MAX_RULES];
+uniform int uPositiveOnly[MAX_RULES];
+uniform int uDeltaMode[MAX_RULES];
+uniform int uDestinationActive[MAX_CHANNELS];
+uniform int uDestinationDiscrete[MAX_CHANNELS];
+uniform int uDestinationLimit[MAX_CHANNELS];
+uniform float uMu[MAX_RULES];
+uniform float uSigma[MAX_RULES];
+uniform float uDt[MAX_RULES];
+uniform float uGain[MAX_RULES];
+uniform float uDecay[MAX_RULES];
+uniform float uWeight[MAX_RULES];
+uniform float uAlpha[MAX_RULES];
 uniform bool uWrap;
-uniform int uDeltaMode;
-uniform bool uDiscrete;
-out float outValue;
+out vec4 outState;
 
 float clamp01(float value) {
   return max(0.0, min(1.0, value));
 }
 
-float sampleSource(ivec2 cell) {
+float readChannel(vec4 state, int channel) {
+  if (channel == 0) return state.r;
+  if (channel == 1) return state.g;
+  return state.b;
+}
+
+void addChannel(inout vec3 state, int channel, float delta) {
+  if (channel == 0) state.r += delta;
+  else if (channel == 1) state.g += delta;
+  else state.b += delta;
+}
+
+void setChannel(inout vec3 state, int channel, float value) {
+  if (channel == 0) state.r = value;
+  else if (channel == 1) state.g = value;
+  else state.b = value;
+}
+
+vec4 fetchKernel(int ruleIndex, int offset) {
+  ivec2 cell = ivec2(offset, 0);
+  if (ruleIndex == 0) return texelFetch(uKernel0, cell, 0);
+  if (ruleIndex == 1) return texelFetch(uKernel1, cell, 0);
+  if (ruleIndex == 2) return texelFetch(uKernel2, cell, 0);
+  if (ruleIndex == 3) return texelFetch(uKernel3, cell, 0);
+  if (ruleIndex == 4) return texelFetch(uKernel4, cell, 0);
+  if (ruleIndex == 5) return texelFetch(uKernel5, cell, 0);
+  if (ruleIndex == 6) return texelFetch(uKernel6, cell, 0);
+  return texelFetch(uKernel7, cell, 0);
+}
+
+float sampleSource(ivec2 cell, int channel) {
   ivec2 size = ivec2(uWorldSize);
   if (uWrap) {
     cell = ivec2((cell.x % size.x + size.x) % size.x, (cell.y % size.y + size.y) % size.y);
   } else if (cell.x < 0 || cell.y < 0 || cell.x >= size.x || cell.y >= size.y) {
     return 0.0;
   }
-  return texelFetch(uSourceField, cell, 0).r;
+  return readChannel(texelFetch(uState, cell, 0), channel);
 }
 
-float growthCurve(float n) {
-  float distance = abs(n - uMu);
+float growthCurve(int ruleIndex, float n) {
+  float mu = uMu[ruleIndex];
+  float sigma = max(0.000001, uSigma[ruleIndex]);
+  float distance = abs(n - mu);
   float squared = distance * distance;
-  if (uDeltaMode == 1) {
-    float reach = 9.0 * uSigma * uSigma;
-    return squared > reach ? -1.0 : pow(1.0 - squared / reach, uAlpha) * 2.0 - 1.0;
+  int mode = uDeltaMode[ruleIndex];
+  if (mode == 1) {
+    float reach = 9.0 * sigma * sigma;
+    return squared > reach ? -1.0 : pow(1.0 - squared / reach, uAlpha[ruleIndex]) * 2.0 - 1.0;
   }
-  if (uDeltaMode == 2) {
-    float p = uSigma / 2.0;
-    float q = uSigma * 2.0;
+  if (mode == 2) {
+    float p = sigma / 2.0;
+    float q = sigma * 2.0;
     if (distance <= p) return 1.0;
     return distance <= q ? (2.0 * (q - distance)) / (q - p) - 1.0 : -1.0;
   }
-  if (uDeltaMode == 3) {
-    return distance <= uSigma ? 1.0 : -1.0;
+  if (mode == 3) {
+    return distance <= sigma ? 1.0 : -1.0;
   }
-  return 2.0 * exp(-squared / (2.0 * uSigma * uSigma)) - 1.0;
+  return 2.0 * exp(-squared / (2.0 * sigma * sigma)) - 1.0;
+}
+
+void finalizeChannel(inout vec3 state, int channel) {
+  if (uDestinationActive[channel] == 0) return;
+  float value = readChannel(vec4(state, 0.0), channel);
+  if (uDestinationDiscrete[channel] == 1) value = value > 0.5 ? 1.0 : 0.0;
+  else if (uDestinationLimit[channel] == 1) value = clamp01(value);
+  else value = max(0.0, value);
+  setChannel(state, channel, value);
 }
 
 void main() {
   ivec2 cell = ivec2(gl_FragCoord.xy);
-  float neighborhood = 0.0;
-  for (int i = 0; i < uKernelCount; i += 1) {
-    vec4 kernel = texelFetch(uKernel, ivec2(i, 0), 0);
-    ivec2 offset = ivec2(round(kernel.xy));
-    neighborhood += sampleSource(cell + offset) * kernel.z;
+  vec4 current = texelFetch(uState, cell, 0);
+  vec3 next = current.rgb;
+
+  for (int ruleIndex = 0; ruleIndex < MAX_RULES; ruleIndex += 1) {
+    if (ruleIndex >= uRuleCount) break;
+    int sourceChannel = uRuleSrc[ruleIndex];
+    int destinationChannel = uRuleDst[ruleIndex];
+    int kernelCount = uKernelCount[ruleIndex];
+    float neighborhood = 0.0;
+
+    for (int kernelIndex = 0; kernelIndex < kernelCount; kernelIndex += 1) {
+      vec4 kernel = fetchKernel(ruleIndex, kernelIndex);
+      ivec2 offset = ivec2(round(kernel.xy));
+      neighborhood += sampleSource(cell + offset, sourceChannel) * kernel.z;
+    }
+
+    float currentDestination = readChannel(current, destinationChannel);
+    float rawGrowth = growthCurve(ruleIndex, neighborhood) * uGain[ruleIndex];
+    float growth = uPositiveOnly[ruleIndex] == 1 ? max(0.0, rawGrowth) : rawGrowth;
+    float delta = uDt[ruleIndex] * growth * uWeight[ruleIndex] - uDecay[ruleIndex] * currentDestination;
+    addChannel(next, destinationChannel, delta);
   }
-  float current = texelFetch(uDestField, cell, 0).r;
-  float growth = growthCurve(neighborhood) * uGain;
-  float rawValue = current + uDt * growth - uDecay * current;
-  if (uDiscrete) outValue = rawValue > 0.5 ? 1.0 : 0.0;
-  else outValue = uLimit ? clamp01(rawValue) : max(0.0, rawValue);
+
+  finalizeChannel(next, 0);
+  finalizeChannel(next, 1);
+  finalizeChannel(next, 2);
+  outState = vec4(next, 0.0);
 }`;
 
   const RENDER_FRAGMENT_SHADER = `#version 300 es
 precision highp float;
 precision highp int;
-uniform sampler2D uField0;
-uniform sampler2D uField1;
-uniform sampler2D uField2;
-uniform sampler2D uField3;
-uniform sampler2D uField4;
-uniform sampler2D uField5;
-uniform sampler2D uField6;
-uniform sampler2D uField7;
+#define MAX_RENDER_CHANNELS ${MAX_RENDER_CHANNELS}
+uniform sampler2D uState;
 uniform vec2 uWorldSize;
 uniform vec2 uCssSize;
 uniform float uDpr;
 uniform vec3 uCamera;
 uniform bool uWrap;
 uniform int uChannelCount;
-uniform int uVisible[8];
-uniform int uPaletteCount[8];
-uniform vec3 uPalettes[64];
+uniform int uChannelComponent[MAX_RENDER_CHANNELS];
+uniform int uVisible[MAX_RENDER_CHANNELS];
+uniform int uPaletteCount[MAX_RENDER_CHANNELS];
+uniform vec3 uPalettes[${MAX_RENDER_CHANNELS * 8}];
 uniform vec3 uBackground;
 out vec4 outColor;
 
+float readComponent(vec4 state, int component) {
+  if (component == 0) return state.r;
+  if (component == 1) return state.g;
+  return state.b;
+}
+
 float sampleChannel(int channelIndex, ivec2 cell) {
-  if (channelIndex == 0) return texelFetch(uField0, cell, 0).r;
-  if (channelIndex == 1) return texelFetch(uField1, cell, 0).r;
-  if (channelIndex == 2) return texelFetch(uField2, cell, 0).r;
-  if (channelIndex == 3) return texelFetch(uField3, cell, 0).r;
-  if (channelIndex == 4) return texelFetch(uField4, cell, 0).r;
-  if (channelIndex == 5) return texelFetch(uField5, cell, 0).r;
-  if (channelIndex == 6) return texelFetch(uField6, cell, 0).r;
-  return texelFetch(uField7, cell, 0).r;
+  return readComponent(texelFetch(uState, cell, 0), uChannelComponent[channelIndex]);
 }
 
 vec3 colorRamp(int channelIndex, float value) {
@@ -725,7 +942,7 @@ void main() {
   ivec2 cell = ivec2(floor(world));
   int visibleCount = 0;
   int singleIndex = 0;
-  for (int i = 0; i < 8; i += 1) {
+  for (int i = 0; i < MAX_RENDER_CHANNELS; i += 1) {
     if (i < uChannelCount && uVisible[i] == 1) {
       visibleCount += 1;
       singleIndex = i;
@@ -737,7 +954,7 @@ void main() {
   }
 
   vec3 color = uBackground;
-  for (int i = 0; i < 8; i += 1) {
+  for (int i = 0; i < MAX_RENDER_CHANNELS; i += 1) {
     if (i >= uChannelCount || uVisible[i] == 0) continue;
     float value = max(0.0, min(1.0, sampleChannel(i, cell)));
     if (value <= 0.00001) continue;
@@ -751,7 +968,7 @@ void main() {
   const BRUSH_FRAGMENT_SHADER = `#version 300 es
 precision highp float;
 precision highp int;
-uniform sampler2D uField;
+uniform sampler2D uState;
 uniform vec2 uWorldSize;
 uniform vec2 uCenter;
 uniform float uRadius;
@@ -759,37 +976,54 @@ uniform float uPower;
 uniform int uMode;
 uniform bool uWrap;
 uniform bool uDiscrete;
-out float outValue;
+uniform int uTargetChannel;
+out vec4 outState;
 
 float clamp01(float value) {
   return max(0.0, min(1.0, value));
 }
 
+float readChannel(vec4 state, int channel) {
+  if (channel == 0) return state.r;
+  if (channel == 1) return state.g;
+  return state.b;
+}
+
+void setChannel(inout vec4 state, int channel, float value) {
+  if (channel == 0) state.r = value;
+  else if (channel == 1) state.g = value;
+  else state.b = value;
+}
+
 void main() {
   ivec2 cell = ivec2(gl_FragCoord.xy);
-  float current = texelFetch(uField, cell, 0).r;
+  vec4 state = texelFetch(uState, cell, 0);
+  float current = readChannel(state, uTargetChannel);
   vec2 delta = vec2(cell) - uCenter;
   if (uWrap) {
     delta -= round(delta / uWorldSize) * uWorldSize;
   }
   float distance = length(delta);
   if (distance > uRadius) {
-    outValue = current;
+    outState = state;
     return;
   }
+  float value = current;
   if (uDiscrete) {
-    outValue = uMode == 1 ? 0.0 : 1.0;
-    return;
+    value = uMode == 1 ? 0.0 : 1.0;
+  } else {
+    float falloff = uRadius <= 0.0 ? 1.0 : 1.0 - distance / uRadius;
+    if (uMode == 1) value = clamp01(current * (1.0 - falloff * uPower));
+    else value = clamp01(current + falloff * uPower);
   }
-  float falloff = uRadius <= 0.0 ? 1.0 : 1.0 - distance / uRadius;
-  if (uMode == 1) outValue = clamp01(current * (1.0 - falloff * uPower));
-  else outValue = clamp01(current + falloff * uPower);
+  setChannel(state, uTargetChannel, value);
+  outState = state;
 }`;
 
   const PLACE_FRAGMENT_SHADER = `#version 300 es
 precision highp float;
 precision highp int;
-uniform sampler2D uField;
+uniform sampler2D uState;
 uniform sampler2D uCells;
 uniform vec2 uWorldSize;
 uniform vec2 uCenter;
@@ -798,11 +1032,25 @@ uniform float uScale;
 uniform float uAngle;
 uniform bool uWrap;
 uniform bool uDiscrete;
-out float outValue;
+uniform int uTargetChannel;
+out vec4 outState;
+
+float readChannel(vec4 state, int channel) {
+  if (channel == 0) return state.r;
+  if (channel == 1) return state.g;
+  return state.b;
+}
+
+void setChannel(inout vec4 state, int channel, float value) {
+  if (channel == 0) state.r = value;
+  else if (channel == 1) state.g = value;
+  else state.b = value;
+}
 
 void main() {
   ivec2 cell = ivec2(gl_FragCoord.xy);
-  float current = texelFetch(uField, cell, 0).r;
+  vec4 state = texelFetch(uState, cell, 0);
+  float current = readChannel(state, uTargetChannel);
   vec2 delta = vec2(cell) + vec2(0.5) - uCenter;
   if (uWrap) {
     delta -= round(delta / uWorldSize) * uWorldSize;
@@ -812,51 +1060,145 @@ void main() {
   vec2 source = vec2(c * delta.x + s * delta.y, -s * delta.x + c * delta.y) / max(0.0001, uScale) + uCellSize * 0.5;
   ivec2 sourceCell = ivec2(floor(source));
   if (sourceCell.x < 0 || sourceCell.y < 0 || sourceCell.x >= int(uCellSize.x) || sourceCell.y >= int(uCellSize.y)) {
-    outValue = current;
+    outState = state;
     return;
   }
-  float value = texelFetch(uCells, sourceCell, 0).r;
-  if (uDiscrete) outValue = max(current >= 0.5 ? 1.0 : 0.0, value >= 0.5 ? 1.0 : 0.0);
-  else outValue = max(current, value);
+  float sourceValue = texelFetch(uCells, sourceCell, 0).r;
+  float value = uDiscrete ? max(current >= 0.5 ? 1.0 : 0.0, sourceValue >= 0.5 ? 1.0 : 0.0) : max(current, sourceValue);
+  setChannel(state, uTargetChannel, value);
+  outState = state;
+}`;
+
+  const RANDOMIZE_FRAGMENT_SHADER = `#version 300 es
+precision highp float;
+precision highp int;
+uniform sampler2D uState;
+uniform vec4 uRect;
+uniform float uSeed;
+uniform int uTargetChannel;
+uniform bool uDiscrete;
+out vec4 outState;
+
+float hash12(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031 + uSeed * 0.0137);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
+}
+
+void setChannel(inout vec4 state, int channel, float value) {
+  if (channel == 0) state.r = value;
+  else if (channel == 1) state.g = value;
+  else state.b = value;
+}
+
+void main() {
+  ivec2 cell = ivec2(gl_FragCoord.xy);
+  vec4 state = texelFetch(uState, cell, 0);
+  bool inside = float(cell.x) >= uRect.x && float(cell.y) >= uRect.y && float(cell.x) < uRect.z && float(cell.y) < uRect.w;
+  float value = 0.0;
+  if (inside) {
+    float roll = hash12(vec2(cell) + vec2(17.0, 29.0));
+    if (roll > 0.86) value = uDiscrete ? 1.0 : hash12(vec2(cell) + vec2(83.0, 41.0));
+  }
+  setChannel(state, uTargetChannel, value);
+  outState = state;
 }`;
 
   const COPY_FRAGMENT_SHADER = `#version 300 es
 precision highp float;
 precision highp int;
-uniform sampler2D uOldField;
+uniform sampler2D uOldState;
 uniform vec2 uOldSize;
 uniform vec2 uNewSize;
 uniform vec2 uOldOrigin;
 uniform vec2 uNewOrigin;
 uniform vec2 uCopySize;
-out float outValue;
+out vec4 outState;
 
 void main() {
   vec2 cell = floor(gl_FragCoord.xy);
   vec2 relative = cell - uNewOrigin;
   if (relative.x < 0.0 || relative.y < 0.0 || relative.x >= uCopySize.x || relative.y >= uCopySize.y) {
-    outValue = 0.0;
+    outState = vec4(0.0);
     return;
   }
   ivec2 oldCell = ivec2(relative + uOldOrigin);
-  outValue = texelFetch(uOldField, oldCell, 0).r;
+  outState = texelFetch(uOldState, oldCell, 0);
 }`;
 
   const CLEAR_FRAGMENT_SHADER = `#version 300 es
 precision highp float;
-out float outValue;
+precision highp int;
+uniform sampler2D uState;
+uniform int uTargetChannel;
+out vec4 outState;
+
+void setChannel(inout vec4 state, int channel, float value) {
+  if (channel == 0) state.r = value;
+  else if (channel == 1) state.g = value;
+  else state.b = value;
+}
+
 void main() {
-  outValue = 0.0;
+  vec4 state = texelFetch(uState, ivec2(gl_FragCoord.xy), 0);
+  setChannel(state, uTargetChannel, 0.0);
+  outState = state;
 }`;
 
   const QUANTIZE_FRAGMENT_SHADER = `#version 300 es
 precision highp float;
 precision highp int;
-uniform sampler2D uField;
-out float outValue;
+uniform sampler2D uState;
+uniform int uTargetChannel;
+out vec4 outState;
+
+float readChannel(vec4 state, int channel) {
+  if (channel == 0) return state.r;
+  if (channel == 1) return state.g;
+  return state.b;
+}
+
+void setChannel(inout vec4 state, int channel, float value) {
+  if (channel == 0) state.r = value;
+  else if (channel == 1) state.g = value;
+  else state.b = value;
+}
+
 void main() {
-  float value = texelFetch(uField, ivec2(gl_FragCoord.xy), 0).r;
-  outValue = value >= 0.5 ? 1.0 : 0.0;
+  vec4 state = texelFetch(uState, ivec2(gl_FragCoord.xy), 0);
+  float value = readChannel(state, uTargetChannel);
+  setChannel(state, uTargetChannel, value >= 0.5 ? 1.0 : 0.0);
+  outState = state;
+}`;
+
+  const REMAP_FRAGMENT_SHADER = `#version 300 es
+precision highp float;
+precision highp int;
+#define MAX_CHANNELS ${MAX_CHANNELS}
+uniform sampler2D uState;
+uniform int uSourceComponent[MAX_CHANNELS];
+out vec4 outState;
+
+float readChannel(vec4 state, int channel) {
+  if (channel == 0) return state.r;
+  if (channel == 1) return state.g;
+  if (channel == 2) return state.b;
+  return 0.0;
+}
+
+void setChannel(inout vec4 state, int channel, float value) {
+  if (channel == 0) state.r = value;
+  else if (channel == 1) state.g = value;
+  else state.b = value;
+}
+
+void main() {
+  vec4 oldState = texelFetch(uState, ivec2(gl_FragCoord.xy), 0);
+  vec4 nextState = vec4(0.0);
+  for (int channel = 0; channel < MAX_CHANNELS; channel += 1) {
+    setChannel(nextState, channel, readChannel(oldState, uSourceComponent[channel]));
+  }
+  outState = nextState;
 }`;
 
   function createProgram(gl, vertexSource, fragmentSource) {
@@ -896,7 +1238,7 @@ void main() {
 
   function normalizeModel(model = {}) {
     const sourceChannels = Array.isArray(model.channels) && model.channels.length ? model.channels : legacyModel(model).channels;
-    const channels = sourceChannels.map((channel, index) => ({
+    const channels = sourceChannels.slice(0, MAX_CHANNELS).map((channel, index) => ({
       id: String(channel.id || `channel-${index}`),
       name: String(channel.name || `Layer ${index + 1}`),
       palette: normalizePalette(channel.palette || channel.colors || DEFAULT_COLORS),
@@ -906,11 +1248,13 @@ void main() {
     const sourceRules = Array.isArray(model.rules) && model.rules.length ? model.rules : [model.rule || DEFAULT_RULE];
     const rules = sourceRules.map((rule, index) => {
       const fallbackId = channels[0]?.id || "channel-0";
+      const sourceId = String(rule.sourceChannelId || rule.src || rule.source || fallbackId);
+      const destinationId = String(rule.destinationChannelId || rule.dst || rule.destination || fallbackId);
       return normalizeRule({
         ...rule,
         id: rule.id || `rule-${index}`,
-        sourceChannelId: ids.has(String(rule.sourceChannelId)) ? String(rule.sourceChannelId) : fallbackId,
-        destinationChannelId: ids.has(String(rule.destinationChannelId)) ? String(rule.destinationChannelId) : fallbackId,
+        sourceChannelId: ids.has(sourceId) ? sourceId : fallbackId,
+        destinationChannelId: ids.has(destinationId) ? destinationId : fallbackId,
       });
     });
     return {
@@ -966,6 +1310,8 @@ void main() {
       layer: rule.layer,
       beta: [...rule.beta],
       eta: [...rule.eta],
+      weight: Number(rule.weight ?? 1),
+      positiveOnly: Boolean(rule.positiveOnly),
     };
   }
 
@@ -987,6 +1333,8 @@ void main() {
       layer: Number(rule.layer || 0),
       beta: [...(rule.beta || [1, 0, 0, 0])],
       eta: [...(rule.eta || [0, 0, 0, 0])],
+      weight: Number(rule.weight ?? 1),
+      positiveOnly: Boolean(rule.positiveOnly),
       kernelTexture: null,
       kernelCount: 0,
     };
@@ -1090,12 +1438,28 @@ void main() {
     return data;
   }
 
+  function componentArray(channels) {
+    const data = new Int32Array(MAX_RENDER_CHANNELS);
+    for (let i = 0; i < Math.min(MAX_RENDER_CHANNELS, channels.length); i += 1) data[i] = channels[i].componentIndex;
+    return data;
+  }
+
   function paletteCountArray(channels) {
     const data = new Int32Array(MAX_RENDER_CHANNELS);
     for (let i = 0; i < Math.min(MAX_RENDER_CHANNELS, channels.length); i += 1) {
       data[i] = Math.max(1, Math.min(8, channels[i].palette.length));
     }
     return data;
+  }
+
+  function packChannel(packed, values, component) {
+    for (let i = 0; i < values.length; i += 1) packed[i * 4 + component] = values[i];
+  }
+
+  function unpackChannel(packed, component) {
+    const values = new Float32Array(packed.length / 4);
+    for (let i = 0; i < values.length; i += 1) values[i] = packed[i * 4 + component];
+    return values;
   }
 
   function emptyMetrics(selectedChannelId, metricScope) {
@@ -1108,31 +1472,6 @@ void main() {
       perChannel: {},
       aggregate: { mass: 0, growth: 0, energy: 0 },
     };
-  }
-
-  function sourceTexture(channel) {
-    return channel.textures[channel.sourceIndex];
-  }
-
-  function destinationTexture(channel) {
-    return channel.textures[1 - channel.sourceIndex];
-  }
-
-  function sourceFramebuffer(channel) {
-    return channel.framebuffers[channel.sourceIndex];
-  }
-
-  function destinationFramebuffer(channel) {
-    return channel.framebuffers[1 - channel.sourceIndex];
-  }
-
-  function swap(channel) {
-    channel.sourceIndex = 1 - channel.sourceIndex;
-  }
-
-  function deleteChannel(gl, channel) {
-    for (const texture of channel.textures || []) gl.deleteTexture(texture);
-    for (const framebuffer of channel.framebuffers || []) gl.deleteFramebuffer(framebuffer);
   }
 
   function clamp(value, low = 0, high = 1) {

@@ -8,6 +8,7 @@
     <link rel="stylesheet" href="src/range-playground.css" />
     <script defer src="src/lenia-lifeforms.js"></script>
     <script defer src="src/compatible-extra-lifeforms.js"></script>
+    <script defer src="src/lenia-repository-lifeforms.js"></script>
     <script defer src="src/webgl-sim.js"></script>
     <script defer src="src/range-playground.js"></script>
   </head>
@@ -180,15 +181,27 @@
             <option value="512">512 x 512</option>
             <option value="768">768 x 768</option>
             <option value="1024">1024 x 1024</option>
+            <option value="custom">Custom</option>
           </select>
         </label>
+
+        <div id="customWorldSizeFields" class="custom-size-fields" hidden>
+          <label class="control">
+            <span>Width</span>
+            <input id="customWorldWidth" type="number" min="16" max="2048" step="1" value="128" />
+          </label>
+          <label class="control">
+            <span>Height</span>
+            <input id="customWorldHeight" type="number" min="16" max="2048" step="1" value="128" />
+          </label>
+        </div>
 
         <label class="control">
           <span>Simulation backend</span>
           <select id="backendSelect">
-            <option value="auto" selected>Auto</option>
+            <option value="auto">Auto</option>
             <option value="webgl">WebGL</option>
-            <option value="cpu">CPU</option>
+            <option value="cpu" selected>CPU</option>
           </select>
         </label>
 
@@ -334,10 +347,14 @@
       </label>
 
       <input id="formSearch" class="search" type="search" placeholder="Search" />
-      <div class="group-organizer" aria-label="Compatible groups">
+      <div class="group-organizer" aria-label="Lifeform collections">
+        <label class="control collection-control">
+          <span>Collection</span>
+          <select id="collectionSelect" aria-label="Collection"></select>
+        </label>
         <div class="group-nav">
           <button id="prevGroupBtn" type="button" title="Previous group" aria-label="Previous group">&lt;</button>
-          <select id="groupSelect" aria-label="Compatible group"></select>
+          <select id="groupSelect" aria-label="Subcollection"></select>
           <button id="nextGroupBtn" type="button" title="Next group" aria-label="Next group">&gt;</button>
         </div>
         <div id="groupRule" class="group-rule">No group selected</div>

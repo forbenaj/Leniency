@@ -367,38 +367,56 @@ function lifeformAssetSlug(form) {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
-  return `lifeform-${form.index}-${code || "form"}`;
+  const prefix = String(form.assetPrefix || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return `lifeform-${prefix ? `${prefix}-` : ""}${form.index}-${code || "form"}`;
 }
 
-function buildLibraryForms(source) {
+function cleanGroupName(value) {
+  return String(value || "")
+    .replace(/^(class|order|family|subfamily|subphylum):\s*/i, "")
+    .trim();
+}
+
+function buildLibraryForms(sources) {
   const forms = [];
-  const groupStack = [];
 
-  for (let i = 0; i < source.length; i += 1) {
-    const item = source[i];
-    if (!Array.isArray(item)) continue;
-    if (item.length === 3 && item[1]) {
-      const level = Number.parseInt(String(item[0]).replace(/^\D+/, ""), 10) || 1;
-      groupStack[level - 1] = item[1];
-      groupStack.length = level;
-      continue;
+  for (const source of sources) {
+    const groupStack = [];
+    const entries = Array.isArray(source.entries) ? source.entries : [];
+    for (let i = 0; i < entries.length; i += 1) {
+      const item = entries[i];
+      if (!Array.isArray(item)) continue;
+      if (item.length === 3 && item[1]) {
+        const level = Number.parseInt(String(item[0]).replace(/^\D+/, ""), 10) || 1;
+        groupStack[level - 1] = item[1];
+        groupStack.length = level;
+        continue;
+      }
+      if (item.length < 4 || !item[3]) continue;
+
+      const { rule, cells } = splitLifeformPayload(item[3]);
+      const ruleInfo = parseRule(rule);
+      const code = displayCode(item[0]);
+      const index = Number(source.indexOffset || 0) + i;
+      forms.push({
+        id: `${source.id}-${index}-${code || i}`,
+        sourceId: source.id,
+        sourceTitle: source.title,
+        sourceIndex: i,
+        assetPrefix: source.assetPrefix || "",
+        index,
+        code,
+        rawCode: item[0] || "",
+        name: item[1] || code,
+        section: cleanGroupName(groupStack.filter(Boolean).at(-1)) || source.title || "",
+        rule,
+        cells,
+        ruleInfo,
+      });
     }
-    if (item.length < 4 || !item[3]) continue;
-
-    const { rule, cells } = splitLifeformPayload(item[3]);
-    const ruleInfo = parseRule(rule);
-    const code = displayCode(item[0]);
-    forms.push({
-      id: `${i}-${code}`,
-      index: i,
-      code,
-      rawCode: item[0] || "",
-      name: item[1] || code,
-      section: groupStack.filter(Boolean).at(-1)?.replace(/^(class|order|family|subfamily):\s*/i, "") || "",
-      rule,
-      cells,
-      ruleInfo,
-    });
   }
 
   return forms.map((form) => ({
@@ -508,28 +526,63 @@ function renderLifeform(form) {
   return encodePng(SIZE, SIZE, rgba);
 }
 
-function loadLifeformSources() {
+function loadLifeformContext() {
   const context = vm.createContext({});
   context.window = context;
-  for (const file of ["lenia-lifeforms.js", "compatible-extra-lifeforms.js"]) {
-    vm.runInContext(fs.readFileSync(path.join(ROOT, "src", file), "utf8"), context, { filename: file });
+  for (const file of ["lenia-lifeforms.js", "compatible-extra-lifeforms.js", "lenia-repository-lifeforms.js"]) {
+    const sourcePath = path.join(ROOT, "src", file);
+    if (fs.existsSync(sourcePath)) {
+      vm.runInContext(fs.readFileSync(sourcePath, "utf8"), context, { filename: file });
+    }
   }
+  return context;
+}
+
+function baseLifeformSources(context) {
+  const animalArr = Array.isArray(context.animalArr) ? context.animalArr : [];
   return [
-    ...(Array.isArray(context.animalArr) ? context.animalArr : []),
-    ...(Array.isArray(context.extraCompatibleAnimalArr) ? context.extraCompatibleAnimalArr : []),
+    {
+      id: "bundled-lenia",
+      title: "Bundled Lenia",
+      entries: animalArr,
+      indexOffset: 0,
+      assetPrefix: "",
+    },
+    {
+      id: "compatible-extra",
+      title: "Compatible extras",
+      entries: Array.isArray(context.extraCompatibleAnimalArr) ? context.extraCompatibleAnimalArr : [],
+      indexOffset: animalArr.length,
+      assetPrefix: "",
+    },
+  ];
+}
+
+function repositoryLifeformSources(context) {
+  return [
+    {
+      id: "lenia-repository",
+      title: "Lenia repository",
+      entries: Array.isArray(context.leniaRepositoryAnimalArr) ? context.leniaRepositoryAnimalArr : [],
+      indexOffset: 0,
+      assetPrefix: "lenia",
+    },
   ];
 }
 
 function main() {
   fs.mkdirSync(OUT_DIR, { recursive: true });
-  const allForms = buildLibraryForms(loadLifeformSources());
-  const groups = parseCompatibleGroups(fs.readFileSync(path.join(ROOT, "strictly-compatible-groups.txt"), "utf8"), allForms);
-  const legacyForms = allForms.filter((form) => isCompatibleRule(form.ruleInfo));
+  const context = loadLifeformContext();
+  const baseForms = buildLibraryForms(baseLifeformSources(context));
+  const repositoryForms = buildLibraryForms(repositoryLifeformSources(context));
+  const groups = parseCompatibleGroups(fs.readFileSync(path.join(ROOT, "docs/strictly-compatible-groups.txt"), "utf8"), baseForms);
+  const legacyForms = baseForms.filter((form) => isCompatibleRule(form.ruleInfo));
   const formsById = new Map();
   for (const group of groups) {
     for (const form of group.forms) formsById.set(form.id, form);
   }
   for (const form of legacyForms) formsById.set(form.id, form);
+  for (const form of repositoryForms) formsById.set(form.id, form);
 
   for (const form of formsById.values()) {
     fs.writeFileSync(path.join(OUT_DIR, `${form.assetSlug}.png`), renderLifeform(form));

@@ -1,5 +1,5 @@
 // Supplemental lifeforms from Chakazul/Lenia animals.json that are referenced by
-// strictly-compatible-groups.txt but not bundled in lenia-lifeforms.js.
+// docs/strictly-compatible-groups.txt but not bundled in lenia-lifeforms.js.
 window.extraCompatibleAnimalArr = [
   [
     "~lwss",

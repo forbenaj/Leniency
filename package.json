@@ -5,7 +5,8 @@
   "description": "A dependency-free Lenia-inspired browser playground.",
   "scripts": {
     "dev": "python -m http.server 5173 --bind 127.0.0.1",
+    "extract:lifeforms": "node scripts/extract-lenia-repository-lifeforms.js",
     "generate:lifeforms": "node scripts/generate-lifeform-images.js",
-    "check": "node --check src/app.js && node --check src/range-playground.js && node --check src/range-sim-worker.js && node --check src/webgl-sim.js && node --check scripts/generate-lifeform-images.js && node src/range-wrap-smoke.test.js"
+    "check": "node --check src/app.js && node --check src/range-playground.js && node --check src/range-sim-worker.js && node --check src/webgl-sim.js && node --check scripts/generate-lifeform-images.js && node --check scripts/extract-lenia-repository-lifeforms.js && node src/range-wrap-smoke.test.js"
   }
 }

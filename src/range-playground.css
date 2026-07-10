@@ -333,6 +333,16 @@ select,
   font-weight: 600;
 }
 
+.custom-size-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.custom-size-fields[hidden] {
+  display: none;
+}
+
 input[type="range"] {
   width: 100%;
   accent-color: var(--text);
@@ -482,6 +492,10 @@ input[type="range"] {
   display: grid;
   gap: 6px;
   margin-bottom: 8px;
+}
+
+.collection-control {
+  gap: 4px;
 }
 
 .group-nav {
