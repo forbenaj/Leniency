@@ -1,6 +1,6 @@
-const fs = require("fs");
-const os = require("os");
-const path = require("path");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 
 const ROOT = path.resolve(__dirname, "..");
 const LENIA_ROOT_CANDIDATES = [
@@ -85,6 +85,7 @@ function escapeNonAscii(text) {
 
 function main() {
   const source = JSON.parse(fs.readFileSync(SOURCE_FILE, "utf8"));
+  if (!Array.isArray(source)) throw new TypeError("Lenia Python/animals.json must contain an array.");
   const entries = source.map(normalizeEntry).filter(Boolean);
   const lifeformCount = entries.filter((entry) => entry.length >= 4).length;
   const body = JSON.stringify(entries, null, 2);
@@ -96,7 +97,9 @@ function main() {
     "",
   ].join("\n");
 
-  fs.writeFileSync(OUT_FILE, output, "utf8");
+  const temporaryFile = `${OUT_FILE}.tmp`;
+  fs.writeFileSync(temporaryFile, output, "utf8");
+  fs.renameSync(temporaryFile, OUT_FILE);
   console.log(`Extracted ${lifeformCount} Lenia repository lifeforms to ${path.relative(ROOT, OUT_FILE)}`);
 }
 

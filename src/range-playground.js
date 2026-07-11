@@ -1,6 +1,13 @@
 const canvas = document.querySelector("#fieldCanvas");
 const glCanvas = document.querySelector("#glFieldCanvas");
 const ctx = canvas.getContext("2d", { alpha: true });
+const LeniaCore = window.LeniaCore;
+const LifeformCatalog = window.LifeformCatalog;
+const MapCodec = window.LeniencyMapCodec;
+
+if (!LeniaCore || !LifeformCatalog || !MapCodec) {
+  throw new Error("Range playground dependencies failed to load.");
+}
 
 const ui = {
   gameModeBtn: document.querySelector("#gameModeBtn"),
@@ -146,9 +153,6 @@ const ui = {
   ],
 };
 
-const ZIP_HEADER = "(zip)";
-const ZIP2_HEADER = "(zip2)";
-const ZIP_START = 192;
 const COMPATIBLE_GROUPS_URL = "docs/strictly-compatible-groups.txt";
 const LIFEFORM_ASSET_BASE = "assets/lifeforms/";
 const SKIP_GROUP_ALERT_KEY = "leniency.skipGroupChangeAlert";
@@ -156,7 +160,7 @@ const DEFAULT_WORLD_SIZE = 128;
 const MIN_WORLD_SIZE = 16;
 const MAX_WORLD_SIZE = 2048;
 const DEFAULT_FORM_NAME = "Orbium unicaudatus";
-const MAP_FILE_VERSION = 2;
+const MAP_FILE_VERSION = MapCodec.MAP_VERSION;
 const MAX_CHANNELS = 3;
 const WEBGL_MAX_RULES = 8;
 const SNAPSHOT_TIMEOUT_MS = 8000;
@@ -266,8 +270,11 @@ let workerReady = false;
 let simWorker = null;
 let snapshotRequestId = 0;
 const pendingSnapshotRequests = new Map();
+let backendRevision = 0;
 let webglSim = null;
 let webglUnavailableReason = "";
+let configureBackendFrame = 0;
+let formSearchFrame = 0;
 let backendPreference = "cpu";
 let activeBackend = "cpu";
 let lastFrameAt = 0;
@@ -289,6 +296,7 @@ let sampleRequestId = 0;
 let gameMode = false;
 let gameWasRunning = false;
 let gameSavedCamera = null;
+let gameSavedWrapAround = null;
 let gameBrushClock = DEFAULT_GAME.brushInterval;
 let gameZoom = DEFAULT_GAME.zoom;
 let gamePlayer = {
@@ -300,6 +308,8 @@ let gamePlayer = {
 };
 const gameKeys = new Set();
 let gameMouse = { locked: false, dx: 0, dy: 0 };
+let groupDialogReturnFocus = null;
+let inertDialogSiblings = [];
 
 function clamp(value, low = 0, high = 1) {
   return Math.max(low, Math.min(high, value));
@@ -402,290 +412,20 @@ class GameStarfield {
 
 const gameStarfield = new GameStarfield();
 
-function fromZip(char) {
-  if (char === "0") return 0;
-  if (char === "1") return 100;
-  return char.charCodeAt(0) - (ZIP_START - 1);
-}
-
-function isZipRepeat(value) {
-  return value.length > 0 && value.charCodeAt(0) >= ZIP_START;
-}
-
-function fromRepeat(value) {
-  if (value === "") return 1;
-  if (!isZipRepeat(value)) return Number.parseInt(value, 10) || 0;
-  if (value.length === 1) return fromZip(value);
-  return fromZip(value[0]) * 100 + fromZip(value[1]);
-}
-
 function parseCellArray(cellText) {
-  let source = cellText || "";
-  const isZip1 = source.startsWith(ZIP_HEADER);
-  const isZip2 = source.startsWith(ZIP2_HEADER);
-  const isZip = isZip1 || isZip2;
-  if (!isZip && /[$!]|\bo\b|\bb\b/.test(source)) return parseRleCellArray(source);
-  if (isZip1) source = source.slice(ZIP_HEADER.length);
-  if (isZip2) source = source.slice(ZIP2_HEADER.length);
-
-  let rows = source.split("/").map((rowText) => {
-    let row = rowText.trim();
-    if (isZip) {
-      row = row
-        .split("-")
-        .map((part) => {
-          const bits = part.split(".");
-          return bits.length === 1 ? part : "0".repeat(fromRepeat(bits[0])) + bits[1];
-        })
-        .join("");
-      return [...row].map((char) => clamp(fromZip(char) / 100));
-    }
-    return row === "" ? [] : row.split(",").map((value) => clamp(Number.parseFloat(value) || 0));
-  });
-
-  if (isZip2) {
-    const doubled = [];
-    for (const row of rows) {
-      const wide = row.flatMap((value) => [value, value]);
-      doubled.push([...wide], [...wide]);
-    }
-    rows = doubled;
-  }
-
-  return {
-    rows,
-    width: rows.reduce((max, row) => Math.max(max, row.length), 0),
-    height: rows.length,
-    flat: null,
-  };
-}
-
-function rleCellValue(token) {
-  if (token === "." || token === "b") return 0;
-  if (token === "o") return 1;
-  if (token.length === 1) return clamp((token.charCodeAt(0) - "A".charCodeAt(0) + 1) / 255);
-  return clamp(((token.charCodeAt(0) - "p".charCodeAt(0)) * 24 + (token.charCodeAt(1) - "A".charCodeAt(0) + 25)) / 255);
-}
-
-function parseRleCellArray(cellText) {
-  const rows = [];
-  let row = [];
-  let countText = "";
-  let prefix = "";
-  const source = String(cellText || "").replace(/\s+/g, "").replace(/!$/, "") + "$";
-
-  function repeatCount() {
-    const count = Number.parseInt(countText || "1", 10);
-    countText = "";
-    return Number.isFinite(count) && count > 0 ? count : 1;
-  }
-
-  for (const char of source) {
-    if (/\d/.test(char)) {
-      countText += char;
-      continue;
-    }
-    if ("pqrstuvwxy@".includes(char)) {
-      prefix = char;
-      continue;
-    }
-
-    const token = `${prefix}${char}`;
-    prefix = "";
-    if (token === "$") {
-      const count = repeatCount();
-      rows.push(row);
-      for (let i = 1; i < count; i += 1) rows.push([]);
-      row = [];
-      continue;
-    }
-
-    const value = rleCellValue(token);
-    const count = repeatCount();
-    for (let i = 0; i < count; i += 1) row.push(value);
-  }
-
-  return {
-    rows,
-    width: rows.reduce((max, nextRow) => Math.max(max, nextRow.length), 0),
-    height: rows.length,
-    flat: null,
-  };
-}
-
-function parseFraction(value) {
-  if (value == null || value === "") return 0;
-  const text = String(value).trim();
-  if (text.includes("/")) {
-    const [top, bottom] = text.split("/").map(Number);
-    return bottom ? top / bottom : 0;
-  }
-  return Number.parseFloat(text) || 0;
-}
-
-function parseRule(ruleText) {
-  const rule = { ...DEFAULT_RULE, beta: [...DEFAULT_RULE.beta], eta: [...DEFAULT_RULE.eta] };
-  const radius = Number.parseInt(ruleText.match(/(?:^|;)R=(\d+)/)?.[1] || "", 10);
-  if (Number.isFinite(radius)) rule.radius = radius;
-
-  const delta = ruleText.match(/d=([a-z0-9/]+)\(([-\d.]+),([-\d.]+)\)\*([-\d.]+)(\+?)/i);
-  if (delta) {
-    rule.deltaName = delta[1];
-    rule.mu = Number.parseFloat(delta[2]);
-    rule.sigma = Number.parseFloat(delta[3]);
-    const multiplier = Math.abs(Number.parseFloat(delta[4]));
-    rule.ts = multiplier > 0 ? Math.round(1 / multiplier) : DEFAULT_RULE.ts;
-    rule.dt = multiplier || DEFAULT_RULE.dt;
-    rule.limitValue = delta[5] !== "+";
-  }
-
-  const kernel = ruleText.match(/k=([^;]+)/i);
-  if (kernel) {
-    const text = kernel[1];
-    const name = text.split("(")[0];
-    const legacyName =
-      name === "bimo4" ? "quad4" : name === "bist4" ? "stpz1/4" : name === "trmo4" ? "quad4" : name;
-    const args = [...text.matchAll(/\(([^)]*)\)/g)].map((match) =>
-      match[1] === "" ? [] : match[1].split(",").map(parseFraction),
-    );
-    rule.coreName = legacyName.replace(/\d+$/, "") === "bump" ? "bump4" : legacyName;
-    if (!["bump4", "quad4", "trap1/5", "stpz1/4", "life"].includes(rule.coreName)) {
-      rule.coreName = legacyName.startsWith("quad") ? "quad4" : legacyName.startsWith("bump") ? "bump4" : legacyName;
-    }
-    const beta = args[0] || [];
-    const eta = args[1] || [];
-    rule.layer = Math.max(beta.length - 1, 0);
-    if (name === "trmo4") rule.layer = 2;
-    for (let i = 0; i < 4; i += 1) {
-      rule.beta[i] = beta[i] || 0;
-      rule.eta[i] = eta[i] || 0;
-    }
-    if (rule.layer <= 1 && rule.beta[0] === 0) rule.beta[0] = 1;
-  }
-
-  return rule;
-}
-
-function splitLifeformPayload(payload) {
-  const parts = payload.split(";cells=");
-  return {
-    rule: parts[0] || "",
-    cells: parts[1] || payload,
-  };
-}
-
-function displayCode(rawCode) {
-  return String(rawCode || "").replace(/^[~*]/, "");
-}
-
-function lifeformAssetSlug(index, code, assetPrefix = "") {
-  const cleanCode = String(code || "form")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-  const cleanPrefix = String(assetPrefix || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-  return `lifeform-${cleanPrefix ? `${cleanPrefix}-` : ""}${index}-${cleanCode || "form"}`;
+  return { ...LeniaCore.parseCellArray(cellText), flat: null };
 }
 
 function slugify(value) {
-  return (
-    String(value || "")
-      .toLowerCase()
-      .replace(/^[~*]+/, "")
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "") || "group"
-  );
+  return LifeformCatalog.slugify(value);
 }
 
 function cleanGroupName(value) {
-  return String(value || "")
-    .replace(/^(class|order|family|subfamily|subphylum):\s*/i, "")
-    .trim();
+  return LifeformCatalog.cleanGroupName(value);
 }
 
 function normalizeLookupText(value) {
-  return String(value || "")
-    .toLowerCase()
-    .replace(/^[~*]+/, "")
-    .replace(/&/g, " and ")
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim()
-    .replace(/\s+/g, " ");
-}
-
-function normalizeCode(value) {
-  return String(value || "")
-    .toLowerCase()
-    .replace(/^[~*]+/, "")
-    .replace(/[^a-z0-9]+/g, "");
-}
-
-function parseFieldMap(ruleText) {
-  const fields = {};
-  for (const part of String(ruleText || "").split(";")) {
-    const [key, ...valueParts] = part.split("=");
-    if (!key || !valueParts.length) continue;
-    fields[key.trim().toLowerCase()] = valueParts.join("=").trim();
-  }
-  return fields;
-}
-
-function parseGroupRule(ruleText) {
-  const fields = parseFieldMap(ruleText);
-  const rule = { ...DEFAULT_RULE, beta: [...DEFAULT_RULE.beta], eta: [...DEFAULT_RULE.eta] };
-  const radius = Number.parseInt(fields.r || "", 10);
-  const ts = Number.parseFloat(fields.t || "");
-  const beta = (fields.b || "1").split(",").map(parseFraction).filter((value) => Number.isFinite(value));
-
-  if (Number.isFinite(radius)) rule.radius = radius;
-  if (Number.isFinite(ts) && ts > 0) {
-    rule.ts = ts;
-    rule.dt = 1 / ts;
-  }
-  if (fields.m != null) rule.mu = Number.parseFloat(fields.m) || rule.mu;
-  if (fields.s != null) rule.sigma = Number.parseFloat(fields.s) || rule.sigma;
-
-  for (let i = 0; i < 4; i += 1) {
-    rule.beta[i] = beta[i] || 0;
-    rule.eta[i] = 0;
-  }
-  rule.layer = Math.max(beta.length - 1, 0);
-  if (rule.layer <= 1 && rule.beta[0] === 0) rule.beta[0] = 1;
-
-  if (rule.radius === 2 || fields.kn === "4") rule.coreName = "life";
-  else if (rule.layer > 0 || fields.kn === "2") rule.coreName = "quad4";
-  else rule.coreName = "bump4";
-
-  if (rule.coreName === "life" || fields.gn === "3") rule.deltaName = "stpz";
-  else if (fields.gn === "2") rule.deltaName = "quad4";
-  else rule.deltaName = "gaus";
-
-  return {
-    ...rule,
-    sourceText: ruleText,
-    perFormRule: fields["per-form"] === "1" || fields.perform === "1",
-    hasKernelHint: fields.kn != null,
-    hasGrowthHint: fields.gn != null,
-  };
-}
-
-function parseGroupItem(line) {
-  const text = line.trim();
-  const [first = "", ...rest] = text.split(/\s+/);
-  const isCodeLike = first.startsWith("~") || /^\d?[A-Z]+\d/i.test(first) || /^C\d/i.test(first) || /^K\d/i.test(first);
-  return {
-    raw: text,
-    code: isCodeLike ? first.replace(/^[~*]+/, "") : "",
-    name: isCodeLike ? rest.join(" ") : text,
-  };
-}
-
-function groupTitle(ruleInfo) {
-  const beta = ruleInfo.beta.slice(0, ruleInfo.layer + 1).map((value) => Number(value.toFixed(4))).join(",");
-  return `R ${ruleInfo.radius} | mu ${ruleInfo.mu.toFixed(3)} | sigma ${ruleInfo.sigma.toFixed(3)} | b ${beta}`;
+  return LifeformCatalog.normalizeLookupText(value);
 }
 
 function ruleLabel(info) {
@@ -702,92 +442,8 @@ function groupRuleLabel(group) {
   return ruleLabel(group.ruleInfo);
 }
 
-function formMatchesItem(form, item) {
-  const itemName = normalizeLookupText(item.name);
-  const formName = normalizeLookupText(form.name);
-  const formBaseName = normalizeLookupText(form.name.split("(")[0]);
-  if (itemName && (formName === itemName || formName.startsWith(`${itemName} `) || formBaseName === itemName)) {
-    return true;
-  }
-
-  const itemCode = normalizeCode(item.code);
-  if (!itemCode) return false;
-  return [form.rawCode, form.code].some((code) => normalizeCode(code) === itemCode);
-}
-
-function findFormForGroupItem(item, forms, usedFormIds) {
-  const byName = forms.find((form) => !usedFormIds.has(form.id) && formMatchesItem(form, { ...item, code: "" }));
-  if (byName) return byName;
-  return forms.find((form) => !usedFormIds.has(form.id) && formMatchesItem(form, { ...item, name: "" })) || null;
-}
-
-function reconcileGroupRule(group) {
-  if (!group.forms.length) return group.ruleInfo;
-  const firstRule = group.forms[0].ruleInfo;
-  const nextRule = {
-    ...group.ruleInfo,
-    beta: [...group.ruleInfo.beta],
-    eta: [...group.ruleInfo.eta],
-  };
-
-  if (!group.ruleInfo.hasKernelHint) {
-    nextRule.coreName = firstRule.coreName;
-    nextRule.layer = firstRule.layer;
-    nextRule.beta = [...firstRule.beta];
-    nextRule.eta = [...firstRule.eta];
-  }
-  if (!group.ruleInfo.hasGrowthHint) {
-    nextRule.deltaName = firstRule.deltaName;
-  }
-  return nextRule;
-}
-
 function parseCompatibleGroups(text, forms) {
-  const groups = [];
-  let currentGroup = null;
-
-  for (const rawLine of String(text || "").split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line) {
-      currentGroup = null;
-      continue;
-    }
-
-    if (/^R\s*=/.test(line)) {
-      const ruleInfo = parseGroupRule(line);
-      currentGroup = {
-        id: `group-${groups.length}`,
-        title: groupTitle(ruleInfo),
-        ruleText: line,
-        ruleInfo,
-        perFormRule: ruleInfo.perFormRule,
-        items: [],
-        forms: [],
-        missingItems: [],
-      };
-      groups.push(currentGroup);
-      continue;
-    }
-
-    if (currentGroup) currentGroup.items.push(parseGroupItem(line));
-  }
-
-  const usedFormIds = new Set();
-  for (const group of groups) {
-    for (const item of group.items) {
-      const form = findFormForGroupItem(item, forms, usedFormIds);
-      if (form) {
-        group.forms.push(form);
-        usedFormIds.add(form.id);
-      } else {
-        group.missingItems.push(item.raw);
-      }
-    }
-    group.ruleInfo = reconcileGroupRule(group);
-    group.title = groupTitle(group.ruleInfo);
-  }
-
-  return groups.filter((group) => group.forms.length > 0);
+  return LifeformCatalog.parseCompatibleGroups(text, forms, DEFAULT_RULE);
 }
 
 async function buildCompatibleGroups(forms) {
@@ -951,56 +607,11 @@ function repositoryLifeformSources() {
 }
 
 function buildLibraryForms(sources = baseLifeformSources()) {
-  const forms = [];
-
-  for (const source of sources) {
-    const groupStack = [];
-    const entries = Array.isArray(source.entries) ? source.entries : [];
-    for (let i = 0; i < entries.length; i += 1) {
-      const item = entries[i];
-      if (!Array.isArray(item)) continue;
-      if (item.length === 3 && item[1]) {
-        const level = Number.parseInt(String(item[0]).replace(/^\D+/, ""), 10) || 1;
-        groupStack[level - 1] = item[1];
-        groupStack.length = level;
-        continue;
-      }
-      if (item.length < 4 || !item[3]) continue;
-
-      const { rule, cells } = splitLifeformPayload(item[3]);
-      const ruleInfo = parseRule(rule);
-
-      const code = displayCode(item[0]);
-      const index = Number(source.indexOffset || 0) + i;
-      const assetSlug = lifeformAssetSlug(index, code, source.assetPrefix);
-      const groups = groupStack.filter(Boolean);
-      forms.push({
-        id: `${source.id}-${index}-${code || i}`,
-        sourceId: source.id,
-        sourceTitle: source.title,
-        sourceIndex: i,
-        index,
-        code,
-        assetPath: `${LIFEFORM_ASSET_BASE}${assetSlug}.png`,
-        rawCode: item[0] || "",
-        name: item[1] || code,
-        section: cleanGroupName(groups[groups.length - 1]) || source.title || "",
-        groups,
-        rule,
-        cells,
-        ruleInfo,
-        cellData: null,
-        previewCanvas: null,
-        previewVersion: -1,
-      });
-    }
-  }
-
-  return forms;
+  return LifeformCatalog.buildLibraryForms(sources, { assetBase: LIFEFORM_ASSET_BASE, defaults: DEFAULT_RULE });
 }
 
 function isCompatibleRule(rule) {
-  return rule.radius === 13 && rule.coreName === "bump4" && rule.layer === 0 && Math.abs(rule.dt - 0.1) < 0.000001;
+  return LifeformCatalog.isCompatibleRule(rule);
 }
 
 function isLifeRule(rule = currentRule) {
@@ -1008,10 +619,7 @@ function isLifeRule(rule = currentRule) {
 }
 
 function hexToRgb(hex) {
-  const clean = String(hex || "#000000").replace("#", "");
-  const full = clean.length === 3 ? clean.split("").map((part) => part + part).join("") : clean;
-  const value = Number.parseInt(full, 16);
-  return [(value >> 16) & 255, (value >> 8) & 255, value & 255];
+  return LeniaCore.hexToRgb(hex);
 }
 
 function cloneRule(rule) {
@@ -1182,16 +790,7 @@ function simulationModel() {
 }
 
 function colorRamp(value) {
-  const scaled = clamp(value) * (palette.length - 1);
-  const base = Math.floor(scaled);
-  const t = scaled - base;
-  const a = palette[base];
-  const b = palette[Math.min(base + 1, palette.length - 1)];
-  return [
-    Math.round(a[0] + (b[0] - a[0]) * t),
-    Math.round(a[1] + (b[1] - a[1]) * t),
-    Math.round(a[2] + (b[2] - a[2]) * t),
-  ];
+  return LeniaCore.colorRamp(value, palette);
 }
 
 function currentColors() {
@@ -1200,6 +799,11 @@ function currentColors() {
 
 function currentRadius() {
   return Number(ui.radiusSlider.value);
+}
+
+function maximumRuleRadius() {
+  writeSelectedRuleFromControls();
+  return rules.reduce((maximum, rule) => Math.max(maximum, Number(rule.radius) || 0), currentRadius());
 }
 
 function currentDt() {
@@ -1368,38 +972,8 @@ function buildMapConfiguration(snapshot) {
   };
 }
 
-function arrayBufferToBase64(buffer) {
-  const bytes = new Uint8Array(buffer);
-  const chunks = [];
-  const chunkSize = 32768;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    chunks.push(String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize)));
-  }
-  return btoa(chunks.join(""));
-}
-
 function float32ArrayToBase64(values) {
-  const copy = new Float32Array(values.length);
-  copy.set(values);
-  return arrayBufferToBase64(copy.buffer);
-}
-
-function base64ToArrayBuffer(text) {
-  const binary = atob(String(text || ""));
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-  return bytes.buffer;
-}
-
-function base64ToFloat32Array(text, expectedLength = 0) {
-  const buffer = base64ToArrayBuffer(text);
-  const values = new Float32Array(buffer);
-  if (expectedLength && values.length !== expectedLength) {
-    const resized = new Float32Array(expectedLength);
-    resized.set(values.subarray(0, expectedLength));
-    return resized;
-  }
-  return values;
+  return MapCodec.encodeFloat32(values);
 }
 
 function fileSafeName(value) {
@@ -1430,15 +1004,25 @@ function downloadMapFile(map, savedAt) {
 function requestWorkerSnapshot() {
   if (!simWorker) return Promise.reject(new Error("Simulation worker is not available."));
   const requestId = ++snapshotRequestId;
+  const revision = backendRevision;
   return new Promise((resolve, reject) => {
     const timeoutId = window.setTimeout(() => {
       pendingSnapshotRequests.delete(requestId);
       reject(new Error("Timed out while saving the map."));
     }, SNAPSHOT_TIMEOUT_MS);
 
-    pendingSnapshotRequests.set(requestId, { resolve, reject, timeoutId });
+    pendingSnapshotRequests.set(requestId, { resolve, reject, timeoutId, revision });
     postWorker("snapshot", { requestId });
   });
+}
+
+function rejectPendingSnapshotRequests(reason) {
+  const error = reason instanceof Error ? reason : new Error(String(reason || "Snapshot request was cancelled."));
+  for (const [requestId, pending] of pendingSnapshotRequests) {
+    window.clearTimeout(pending.timeoutId);
+    pending.reject(error);
+    pendingSnapshotRequests.delete(requestId);
+  }
 }
 
 async function readFieldSnapshot() {
@@ -1476,87 +1060,16 @@ async function saveMapFile() {
         length: channel.values.length,
         data: float32ArrayToBase64(channel.values),
       })),
-      field: {
-        encoding: "float32-base64",
-        littleEndian: true,
-        length: (snapshot.values || snapshot.channels?.[0]?.values || new Float32Array()).length,
-        data: float32ArrayToBase64(snapshot.values || snapshot.channels?.[0]?.values || new Float32Array()),
-      },
     };
     downloadMapFile(map, savedAt);
   } catch (error) {
     console.error(error);
     ui.stateLabel.textContent = "Save failed";
+    ui.stateLabel.title = String(error?.message || error);
   } finally {
     ui.saveMapBtn.disabled = false;
     ui.saveMapBtn.removeAttribute("aria-busy");
   }
-}
-
-function modelFromMap(map) {
-  const layerConfig = map.configuration?.layers;
-  if (layerConfig?.channels?.length) {
-    const nextChannels = layerConfig.channels.slice(0, MAX_CHANNELS).map(cloneChannel);
-    const ids = new Set(nextChannels.map((channel) => channel.id));
-    const fallbackId = nextChannels[0]?.id || "channel-0";
-    const nextRules = (layerConfig.rules || []).map(cloneRule).map((rule, index) => ({
-      ...rule,
-      id: rule.id || `rule-${index}`,
-      sourceChannelId: ids.has(rule.sourceChannelId) ? rule.sourceChannelId : fallbackId,
-      destinationChannelId: ids.has(rule.destinationChannelId) ? rule.destinationChannelId : fallbackId,
-    }));
-    return {
-      selectedChannelId: layerConfig.selectedChannelId || layerConfig.channels[0].id,
-      metricScope: layerConfig.metricScope === "aggregate" ? "aggregate" : "selected",
-      wrapAround: layerConfig.wrapAround !== false,
-      channels: nextChannels,
-      rules: nextRules,
-    };
-  }
-
-  const rule = cloneRule(map.configuration?.rule || DEFAULT_RULE);
-  rule.id = "rule-0";
-  rule.sourceChannelId = "channel-0";
-  rule.destinationChannelId = "channel-0";
-  return {
-    selectedChannelId: "channel-0",
-    metricScope: "selected",
-    wrapAround: rule.wrapAround !== false,
-    channels: [
-      {
-        id: "channel-0",
-        name: "Layer 1",
-        palette: normalizePalette(map.configuration?.advanced?.colors || DEFAULT_COLORS),
-        visible: true,
-      },
-    ],
-    rules: [rule],
-  };
-}
-
-function fieldsFromMap(map, model, width, height) {
-  const expectedLength = width * height;
-  if (Array.isArray(map.fields) && map.fields.length) {
-    return map.fields
-      .map((field) => {
-        const channelId = field.channelId || field.id;
-        if (!model.channels.some((channel) => channel.id === channelId)) return null;
-        return {
-          id: channelId,
-          values: base64ToFloat32Array(field.data, field.length || expectedLength),
-        };
-      })
-      .filter(Boolean);
-  }
-  if (map.field?.data) {
-    return [
-      {
-        id: model.channels[0]?.id || "channel-0",
-        values: base64ToFloat32Array(map.field.data, map.field.length || expectedLength),
-      },
-    ];
-  }
-  return [];
 }
 
 function applyLoadedModel(model) {
@@ -1576,14 +1089,111 @@ function applyLoadedModel(model) {
   syncSelectedLayerControls();
 }
 
+function restoreMapInterface(configuration = {}) {
+  setSliderValue(ui.speedSlider, configuration.speed);
+  setSliderValue(ui.safeSlider, configuration.advanced?.safe);
+  setSliderValue(ui.brushSizeSlider, configuration.brush?.size);
+  setSliderValue(ui.brushPowerSlider, configuration.brush?.power);
+
+  const game = configuration.game || {};
+  if (["stars", "none"].includes(game.background)) ui.gameBackgroundSelect.value = game.background;
+  for (const [input, value, percent = false] of [
+    [ui.gameStarDensitySlider, game.starDensity],
+    [ui.gameStarSpeedSlider, game.starSpeed],
+    [ui.gameStarBrightnessSlider, game.starBrightness],
+    [ui.gameAccelSlider, game.accel],
+    [ui.gameSpeedSlider, game.maxSpeed],
+    [ui.gameFrictionSlider, game.friction],
+    [ui.gameMouseSensitivitySlider, game.mouseSensitivity],
+    [ui.gameBrushIntervalSlider, game.brushInterval],
+    [ui.gameCameraCenterPullSlider, game.cameraCenterPull],
+    [ui.gameCameraEdgePullSlider, game.cameraEdgePull],
+    [ui.gameCameraInnerZoneSlider, game.cameraInnerZone, true],
+    [ui.gameCameraEdgeZoneSlider, game.cameraEdgeZone, true],
+    [ui.gameCameraGuardZoneSlider, game.cameraGuardZone, true],
+    [ui.gameMinZoomSlider, game.minZoom],
+    [ui.gameMaxZoomSlider, game.maxZoom],
+  ]) {
+    setSliderValue(input, percent && Number.isFinite(Number(value)) ? Number(value) * 100 : value);
+  }
+  syncGameZoomRange();
+  setGameZoom(Number.isFinite(Number(game.zoom)) ? Number(game.zoom) : gameZoom);
+
+  const savedCamera = configuration.camera;
+  if (savedCamera && typeof savedCamera === "object") {
+    if (Number.isFinite(Number(savedCamera.x))) camera.x = Number(savedCamera.x);
+    if (Number.isFinite(Number(savedCamera.y))) camera.y = Number(savedCamera.y);
+    if (Number.isFinite(Number(savedCamera.scale))) camera.scale = clamp(Number(savedCamera.scale), 0.65, 64);
+  }
+  const savedPlayer = configuration.gamePlayer;
+  if (savedPlayer && typeof savedPlayer === "object") {
+    if (Number.isFinite(Number(savedPlayer.x))) gamePlayer.x = Number(savedPlayer.x);
+    if (Number.isFinite(Number(savedPlayer.y))) gamePlayer.y = Number(savedPlayer.y);
+    if (Number.isFinite(Number(savedPlayer.vx))) gamePlayer.vx = Number(savedPlayer.vx);
+    if (Number.isFinite(Number(savedPlayer.vy))) gamePlayer.vy = Number(savedPlayer.vy);
+    gamePlayer.initialized = Boolean(savedPlayer.initialized);
+  }
+
+  const savedTool = configuration.state?.currentTool;
+  setTool(["pan", "form", "paint", "erase", "sample"].includes(savedTool) ? savedTool : currentTool);
+
+  const savedLibrary = configuration.library;
+  if (savedLibrary && typeof savedLibrary === "object") {
+    const collectionIndex = lifeformCollections.findIndex((collection) => collection.id === savedLibrary.collectionId);
+    if (collectionIndex >= 0) {
+      activeCollectionIndex = collectionIndex;
+      const groupIndex = lifeformCollections[collectionIndex].groups.findIndex((group) => group.id === savedLibrary.groupId);
+      activeGroupIndex = groupIndex >= 0 ? groupIndex : 0;
+    }
+    const formId = savedLibrary.selectedForm?.id;
+    const restoredForm = catalogForms.find((form) => form.id === formId);
+    if (restoredForm) selectedForm = restoredForm;
+    renderGroupOrganizer();
+    renderFormList();
+    if (selectedForm) {
+      const collection = activeCollection();
+      const group = activeGroup();
+      ui.selectedForm.textContent = `${selectedForm.code} - ${selectedForm.name}\n${
+        collection && group ? `${collection.title} / ${group.title}` : group?.title || ""
+      }`;
+    }
+  }
+
+  const savedPlacement = configuration.pendingPlacement;
+  if (savedPlacement && typeof savedPlacement === "object") {
+    const form = catalogForms.find((candidate) => candidate.id === savedPlacement.form?.id);
+    if (form) {
+      if (!form.cellData) form.cellData = parseCellArray(form.cells);
+      pendingPlacement = {
+        form,
+        cellData: form.cellData,
+        x: clamp(Number.isFinite(Number(savedPlacement.x)) ? Number(savedPlacement.x) : worldWidth / 2, 0, worldWidth),
+        y: clamp(Number.isFinite(Number(savedPlacement.y)) ? Number(savedPlacement.y) : worldHeight / 2, 0, worldHeight),
+        scale: clamp(Number(savedPlacement.scale) || 1, 0.25, 5),
+        angle: Number.isFinite(Number(savedPlacement.angle)) ? Number(savedPlacement.angle) : 0,
+      };
+    }
+  } else {
+    pendingPlacement = null;
+  }
+
+  syncLabels();
+  return typeof configuration.state?.isRunning === "boolean" ? configuration.state.isRunning : null;
+}
+
 async function loadMapFile(file) {
   if (!file) return;
+  const wasRunning = isRunning;
+  ui.loadMapBtn.disabled = true;
+  ui.loadMapBtn.setAttribute("aria-busy", "true");
   try {
-    const map = JSON.parse(await file.text());
-    const width = Number(map.world?.width || DEFAULT_WORLD_SIZE);
-    const height = Number(map.world?.height || width);
-    const model = modelFromMap(map);
-    const loadedFields = fieldsFromMap(map, model, width, height);
+    const decoded = await MapCodec.readMapFile(file);
+    const { map, width, height, fields: loadedFields } = decoded;
+    const model = decoded.model;
+    setRunning(false);
+    pendingStepCount = 0;
+    workerBusy = false;
+    backendRevision += 1;
     applyLoadedModel(model);
     worldWidth = width;
     worldHeight = height;
@@ -1593,9 +1203,17 @@ async function loadMapFile(file) {
     gamePlayer.x = worldWidth / 2;
     gamePlayer.y = worldHeight / 2;
     makeBuffers();
+    const restoredRunning = restoreMapInterface(map.configuration);
     clampCamera();
-    simTime = Number(map.configuration?.state?.simTime || 0);
-    metrics = map.configuration?.state?.metrics || { mass: 0, growth: 0, energy: 0 };
+    const savedTime = Number(map.configuration?.state?.simTime);
+    simTime = Number.isFinite(savedTime) && savedTime >= 0 ? savedTime : 0;
+    metrics = { mass: 0, growth: 0, energy: 0 };
+    const savedPreference = map.configuration?.backendPreference;
+    if (["auto", "webgl", "cpu"].includes(savedPreference)) {
+      backendPreference = savedPreference;
+      ui.backendSelect.value = savedPreference;
+      startBackend({ resetField: false });
+    }
     sendBackend(
       "loadSnapshot",
       {
@@ -1611,9 +1229,15 @@ async function loadMapFile(file) {
     );
     requestRender();
     updateMetrics();
+    setRunning(restoredRunning ?? wasRunning);
   } catch (error) {
     console.error(error);
+    setRunning(wasRunning);
     ui.stateLabel.textContent = "Load failed";
+    ui.stateLabel.title = String(error?.message || error);
+  } finally {
+    ui.loadMapBtn.disabled = false;
+    ui.loadMapBtn.removeAttribute("aria-busy");
   }
 }
 
@@ -1647,12 +1271,13 @@ function resizeFromCustomWorldSize() {
 }
 
 function postWorker(type, payload = {}, transfer = []) {
-  if (!simWorker) return;
-  simWorker.postMessage({ type, ...payload }, transfer);
+  if (!simWorker) return false;
+  simWorker.postMessage({ type, revision: backendRevision, ...payload }, transfer);
+  return true;
 }
 
 function usingWebgl() {
-  return activeBackend === "webgl" && webglSim;
+  return Boolean(activeBackend === "webgl" && webglSim);
 }
 
 function backendReady() {
@@ -1674,8 +1299,14 @@ function modelCanUseWebgl(model = simulationModel()) {
   return !webglUnavailableForModel(model);
 }
 
-function switchFromWebglToCpu(model) {
-  const snapshot = webglSim?.snapshot();
+function switchFromWebglToCpu(model, { reason = "", replay = null } = {}) {
+  let snapshot = null;
+  try {
+    snapshot = webglSim?.snapshot() || null;
+  } catch (snapshotError) {
+    console.error("Could not preserve the WebGL field during fallback.", snapshotError);
+  }
+  if (reason) webglUnavailableReason = reason;
   activeBackend = "cpu";
   glCanvas.hidden = true;
   startWorker();
@@ -1687,11 +1318,14 @@ function switchFromWebglToCpu(model) {
         simTime,
       },
     });
-  } else {
-    postWorker("model", { model });
   }
+  if (replay) postWorker(replay.type, replay.payload, replay.transfer || []);
   setStateLabel();
   syncBackendLabel();
+  if (reason) {
+    ui.stateLabel.textContent = "CPU fallback";
+    ui.stateLabel.title = `WebGL failed: ${reason}`;
+  }
 }
 
 function backendName() {
@@ -1720,7 +1354,12 @@ function setStateLabel() {
 function configureBackend() {
   const model = simulationModel();
   if (usingWebgl() && modelCanUseWebgl(model)) {
-    webglSim.setModel(model);
+    try {
+      webglSim.setModel(model);
+    } catch (error) {
+      console.error(error);
+      switchFromWebglToCpu(model, { reason: String(error?.message || error) });
+    }
     return;
   }
   if (usingWebgl()) {
@@ -1731,46 +1370,59 @@ function configureBackend() {
   postWorker("model", { model });
 }
 
+function scheduleBackendConfiguration() {
+  if (configureBackendFrame) return;
+  configureBackendFrame = requestAnimationFrame(() => {
+    configureBackendFrame = 0;
+    configureBackend();
+  });
+}
+
 function setBackendPalette() {
   configureBackend();
 }
 
 function sendBackend(type, payload = {}, transfer = []) {
   if (!usingWebgl()) {
-    postWorker(type, payload, transfer);
-    return;
+    return postWorker(type, payload, transfer);
   }
 
-  if (type === "config") {
-    webglSim.setConfig(payload.config);
-  } else if (type === "palette") {
-    webglSim.setPalette(payload.colors);
-  } else if (type === "model") {
-    webglSim.setModel(payload.model);
-  } else if (type === "resize") {
-    webglSim.resize(payload.width, payload.height);
-    metrics = webglSim.metrics;
-    profile = { ...profile, ...webglSim.profile };
-  } else if (type === "clear") {
-    webglSim.clear();
-    metrics = webglSim.metrics;
-    profile = { ...profile, ...webglSim.profile };
-  } else if (type === "randomize") {
-    webglSim.randomize(payload.rect, payload.channelId);
-    metrics = webglSim.metrics;
-    profile = { ...profile, ...webglSim.profile };
-  } else if (type === "place") {
-    webglSim.place(payload.placement);
-    profile = { ...profile, ...webglSim.profile };
-  } else if (type === "brush") {
-    webglSim.brush(payload);
-    profile = { ...profile, ...webglSim.profile };
-  } else if (type === "sample") {
-    ui.sampleLabel.textContent = webglSim.sample(payload.x, payload.y, payload.channelId, payload.scope).toFixed(3);
-  } else if (type === "loadSnapshot") {
-    webglSim.loadSnapshot(payload.snapshot);
-    metrics = webglSim.metrics;
-    profile = { ...profile, ...webglSim.profile };
+  try {
+    if (type === "resize") {
+      webglSim.resize(payload.width, payload.height);
+      metrics = webglSim.metrics;
+      profile = { ...profile, ...webglSim.profile };
+    } else if (type === "clear") {
+      webglSim.clear();
+      metrics = webglSim.metrics;
+      profile = { ...profile, ...webglSim.profile };
+    } else if (type === "randomize") {
+      webglSim.randomize(payload.rect, payload.channelId);
+      metrics = webglSim.metrics;
+      profile = { ...profile, ...webglSim.profile };
+    } else if (type === "place") {
+      webglSim.place(payload.placement);
+      profile = { ...profile, ...webglSim.profile };
+    } else if (type === "brush") {
+      webglSim.brush(payload);
+      profile = { ...profile, ...webglSim.profile };
+    } else if (type === "sample") {
+      ui.sampleLabel.textContent = webglSim.sample(payload.x, payload.y, payload.channelId, payload.scope).toFixed(3);
+    } else if (type === "loadSnapshot") {
+      webglSim.loadSnapshot(payload.snapshot);
+      metrics = webglSim.readMetrics(performance.now(), true) || webglSim.metrics;
+      profile = { ...profile, ...webglSim.profile };
+    } else {
+      throw new TypeError(`Unsupported WebGL command "${type}".`);
+    }
+    return true;
+  } catch (error) {
+    console.error(error);
+    switchFromWebglToCpu(simulationModel(), {
+      reason: String(error?.message || error),
+      replay: { type, payload, transfer },
+    });
+    return false;
   }
 }
 
@@ -1808,15 +1460,16 @@ function updateMetrics() {
   const scopedMetrics =
     metricScope === "aggregate" ? metrics.aggregate || metrics : metrics.perChannel?.[selectedChannelId] || metrics;
   ui.massLabel.textContent = Number(scopedMetrics.mass || 0).toFixed(4);
-  ui.growthLabel.textContent = Number(scopedMetrics.growth || 0).toFixed(4);
+  ui.growthLabel.textContent = usingWebgl() ? "—" : Number(scopedMetrics.growth || 0).toFixed(4);
+  ui.growthLabel.title = usingWebgl() ? "Growth reduction is available on the CPU backend." : "";
   ui.energyLabel.textContent = Number(scopedMetrics.energy || 0).toFixed(4);
   ui.timeLabel.textContent = `t ${simTime.toFixed(1)}`;
   ui.simMsLabel.textContent = profile.stepSimulationMs.toFixed(1);
   ui.colorizeMsLabel.textContent = profile.colorizeMs.toFixed(1);
   ui.bufferMsLabel.textContent = profile.updateFieldBufferMs.toFixed(1);
   ui.renderMsLabel.textContent = profile.renderMs.toFixed(1);
-  ui.chunkLabel.textContent = `${profile.simChunks}/${profile.activeChunks}`;
-  ui.patchLabel.textContent = String(profile.patches);
+  ui.chunkLabel.textContent = usingWebgl() ? "GPU" : `${profile.simChunks}/${profile.activeChunks}`;
+  ui.patchLabel.textContent = usingWebgl() ? "—" : String(profile.patches);
 }
 
 function resetRenderBuffer() {
@@ -1923,8 +1576,12 @@ function renderLayerPanel() {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "layer-item";
-    if (channel.id === selectedChannelId) button.classList.add("selected");
+    const isSelected = channel.id === selectedChannelId;
+    if (isSelected) button.classList.add("selected");
     if (channel.visible === false) button.classList.add("muted");
+    button.setAttribute("role", "option");
+    button.setAttribute("aria-selected", String(isSelected));
+    button.setAttribute("aria-label", `${channel.name}, ${channel.visible === false ? "hidden" : "visible"}`);
 
     const swatch = document.createElement("span");
     swatch.className = "layer-swatch";
@@ -2036,7 +1693,6 @@ function renameSelectedLayer(value) {
   if (!channel) return;
   channel.name = String(value || "Layer").slice(0, 36);
   renderLayerPanel();
-  configureBackend();
 }
 
 function setSelectedLayerVisible(value) {
@@ -2057,7 +1713,6 @@ function setSelectedLayerSource(sourceChannelId) {
 
 function setMetricScope(value) {
   metricScope = value === "aggregate" ? "aggregate" : "selected";
-  configureBackend();
   updateMetrics();
 }
 
@@ -2126,6 +1781,7 @@ function syncGameModeButton() {
   ui.gameModeBtn.classList.toggle("active", gameMode);
   ui.gameModeBtn.setAttribute("aria-pressed", gameMode ? "true" : "false");
   ui.gameModeBtn.textContent = gameMode ? "Exit" : "Game";
+  ui.gameModeBtn.setAttribute("aria-label", gameMode ? "Exit Game Mode" : "Enter Game Mode");
   ui.gameModeBtn.title = gameMode ? "Exit Game Mode" : "Game Mode";
   document.body.classList.toggle("game-mode", gameMode);
 }
@@ -2165,6 +1821,7 @@ function setGameMode(value) {
   if (gameMode) {
     gameWasRunning = isRunning;
     gameSavedCamera = { ...camera };
+    gameSavedWrapAround = ui.wrapToggle.checked;
     if (!gamePlayer.initialized) {
       gamePlayer.x = camera.x;
       gamePlayer.y = camera.y;
@@ -2178,6 +1835,11 @@ function setGameMode(value) {
     setRunning(true);
   } else {
     if (document.pointerLockElement === canvas && document.exitPointerLock) document.exitPointerLock();
+    if (gameSavedWrapAround != null) {
+      ui.wrapToggle.checked = gameSavedWrapAround;
+      gameSavedWrapAround = null;
+      configureBackend();
+    }
     if (gameSavedCamera) camera = { ...gameSavedCamera };
     camera.scale = clamp(camera.scale, 0.65, 28);
     clampCamera();
@@ -2291,12 +1953,19 @@ function updateGameMode(elapsed) {
 }
 
 function setTab(name) {
-  ui.timeTabBtn.classList.toggle("active", name === "time");
-  ui.gameTabBtn.classList.toggle("active", name === "game");
-  ui.advancedTabBtn.classList.toggle("active", name === "advanced");
-  ui.timeTab.classList.toggle("active", name === "time");
-  ui.gameTab.classList.toggle("active", name === "game");
-  ui.advancedTab.classList.toggle("active", name === "advanced");
+  for (const entry of [
+    { name: "time", button: ui.timeTabBtn, panel: ui.timeTab },
+    { name: "game", button: ui.gameTabBtn, panel: ui.gameTab },
+    { name: "advanced", button: ui.advancedTabBtn, panel: ui.advancedTab },
+  ]) {
+    const active = name === entry.name;
+    entry.button.classList.toggle("active", active);
+    entry.button.setAttribute("aria-selected", String(active));
+    entry.button.tabIndex = active ? 0 : -1;
+    entry.panel.classList.toggle("active", active);
+    entry.panel.hidden = !active;
+    entry.panel.setAttribute("aria-hidden", String(!active));
+  }
 }
 
 function setTool(tool) {
@@ -2306,6 +1975,11 @@ function setTool(tool) {
   ui.paintToolBtn.classList.toggle("active", tool === "paint");
   ui.eraseToolBtn.classList.toggle("active", tool === "erase");
   ui.sampleToolBtn.classList.toggle("active", tool === "sample");
+  ui.panToolBtn.setAttribute("aria-pressed", String(tool === "pan"));
+  ui.lifeToolBtn.setAttribute("aria-pressed", String(tool === "form"));
+  ui.paintToolBtn.setAttribute("aria-pressed", String(tool === "paint"));
+  ui.eraseToolBtn.setAttribute("aria-pressed", String(tool === "erase"));
+  ui.sampleToolBtn.setAttribute("aria-pressed", String(tool === "sample"));
   canvas.style.cursor = tool === "pan" ? "grab" : tool === "form" ? "copy" : tool === "sample" ? "crosshair" : "cell";
 }
 
@@ -2337,7 +2011,8 @@ function renderFormList() {
   const query = ui.formSearch.value.trim().toLowerCase();
   const group = activeGroup();
   const forms = group ? group.forms : [];
-  ui.formList.innerHTML = "";
+  const fragment = document.createDocumentFragment();
+  let renderedCount = 0;
   for (const form of forms) {
     if (query && !formSearchText(form).includes(query)) continue;
 
@@ -2367,15 +2042,17 @@ function renderFormList() {
     button.append(image, label);
     button.title = `${form.code} ${form.name}\n${form.rule}`;
     button.addEventListener("click", () => selectForm(form));
-    ui.formList.append(button);
+    fragment.append(button);
+    renderedCount += 1;
   }
 
-  if (!ui.formList.children.length) {
+  if (!renderedCount) {
     const empty = document.createElement("div");
     empty.className = "form-empty";
     empty.textContent = query ? "No forms match this search." : "No forms in this group.";
-    ui.formList.append(empty);
+    fragment.append(empty);
   }
+  ui.formList.replaceChildren(fragment);
 }
 
 function renderGroupOrganizer() {
@@ -2461,13 +2138,29 @@ function commitCatalogSelection(collectionIndex, groupIndex, { selectFirst = tru
   requestRender();
 }
 
+function setDialogBackgroundInert(value) {
+  if (value) {
+    inertDialogSiblings = [...document.body.children].filter(
+      (element) => element !== ui.groupChangeDialog && !element.inert,
+    );
+    for (const element of inertDialogSiblings) element.inert = true;
+    return;
+  }
+  for (const element of inertDialogSiblings) element.inert = false;
+  inertDialogSiblings = [];
+}
+
 function hideGroupChangeDialog() {
   ui.groupChangeDialog.hidden = true;
+  ui.groupChangeDialog.setAttribute("aria-hidden", "true");
+  setDialogBackgroundInert(false);
   pendingCollectionIndex = -1;
   pendingGroupIndex = -1;
   ui.skipGroupAlert.checked = false;
   ui.collectionSelect.value = String(activeCollectionIndex);
   ui.groupSelect.value = String(activeGroupIndex);
+  groupDialogReturnFocus?.focus?.();
+  groupDialogReturnFocus = null;
 }
 
 function showGroupChangeDialog(collectionIndex, groupIndex) {
@@ -2476,8 +2169,11 @@ function showGroupChangeDialog(collectionIndex, groupIndex) {
   if (!group) return;
   pendingCollectionIndex = collectionIndex;
   pendingGroupIndex = groupIndex;
+  groupDialogReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   ui.groupChangeMessage.textContent = `Changing to ${collection.title} / ${group.title} updates the field's simulation values to ${groupRuleLabel(group)}. Existing lifeforms may become unstable.`;
   ui.groupChangeDialog.hidden = false;
+  ui.groupChangeDialog.setAttribute("aria-hidden", "false");
+  setDialogBackgroundInert(true);
   ui.confirmGroupChangeBtn.focus();
 }
 
@@ -2674,13 +2370,18 @@ function drawGameBackground() {
 function render() {
   const drawStart = performance.now();
   if (usingWebgl()) {
-    webglSim.render({
-      cssWidth,
-      cssHeight,
-      dpr,
-      camera,
-      background: backgroundColor(),
-    });
+    try {
+      webglSim.render({
+        cssWidth,
+        cssHeight,
+        dpr,
+        camera,
+        background: backgroundColor(),
+      });
+    } catch (error) {
+      console.error(error);
+      switchFromWebglToCpu(simulationModel(), { reason: String(error?.message || error) });
+    }
   }
 
   ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -2688,7 +2389,7 @@ function render() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
   if (!usingWebgl()) {
-    ctx.fillStyle = "#080618";
+    ctx.fillStyle = backgroundColor();
     ctx.fillRect(0, 0, cssWidth, cssHeight);
 
     ctx.imageSmoothingEnabled = false;
@@ -2932,10 +2633,12 @@ function applyFrame(message) {
 function handleWorkerMessage(event) {
   if (activeBackend !== "cpu") return;
   const message = event.data;
+  if (Number.isSafeInteger(message.revision) && message.revision !== backendRevision) return;
   if (message.type === "ready") {
     workerReady = true;
     setStateLabel();
     syncBackendLabel();
+    drainStepQueue();
     return;
   }
 
@@ -2975,26 +2678,31 @@ function handleWorkerMessage(event) {
 
   if (message.type === "error") {
     workerBusy = false;
-    for (const [requestId, pending] of pendingSnapshotRequests) {
-      window.clearTimeout(pending.timeoutId);
-      pending.reject(new Error(message.message || "Simulation worker error."));
-      pendingSnapshotRequests.delete(requestId);
-    }
+    rejectPendingSnapshotRequests(new Error(message.message || "Simulation worker error."));
     ui.stateLabel.textContent = "Worker error";
+    ui.stateLabel.title = message.message || "Simulation worker error.";
   }
 }
 
 function startWorker() {
+  rejectPendingSnapshotRequests(new Error("Simulation worker restarted."));
   if (simWorker) simWorker.terminate();
+  backendRevision += 1;
   simWorker = null;
   workerReady = false;
   workerBusy = false;
-  simWorker = new Worker("src/range-sim-worker.js");
-  simWorker.addEventListener("message", handleWorkerMessage);
-  simWorker.addEventListener("error", () => {
+  const worker = new Worker("src/range-sim-worker.js?v=0.2.0");
+  simWorker = worker;
+  worker.addEventListener("message", (event) => {
+    if (simWorker === worker) handleWorkerMessage(event);
+  });
+  worker.addEventListener("error", (event) => {
+    if (simWorker !== worker) return;
     workerReady = false;
     workerBusy = false;
+    rejectPendingSnapshotRequests(new Error(event.message || "Simulation worker crashed."));
     ui.stateLabel.textContent = "Worker error";
+    ui.stateLabel.title = event.message || "Simulation worker crashed.";
   });
   postWorker("init", {
     width: worldWidth,
@@ -3019,9 +2727,11 @@ function startBackend({ resetField = true } = {}) {
   if (canTryWebgl) {
     try {
       if (simWorker) {
+        rejectPendingSnapshotRequests(new Error("Simulation backend changed."));
         simWorker.terminate();
         simWorker = null;
       }
+      backendRevision += 1;
       if (!webglSim) webglSim = new window.WebGLLeniaSim(glCanvas);
       activeBackend = "webgl";
       glCanvas.hidden = false;
@@ -3069,22 +2779,28 @@ function drainStepQueue() {
   if (usingWebgl()) {
     const count = Math.min(4, pendingStepCount);
     pendingStepCount -= count;
-    const nextProfile = webglSim.step(count);
-    profile = {
-      ...profile,
-      ...webglSim.profile,
-      stepSimulationMs: nextProfile.stepSimulationMs,
-      colorizeMs: 0,
-      updateFieldBufferMs: 0,
-      patches: 0,
-    };
-    const nextMetrics = webglSim.readMetrics(performance.now());
-    if (nextMetrics) metrics = nextMetrics;
-    simTime += currentStepDt() * nextProfile.steps;
-    simStepCount += nextProfile.steps;
-    requestRender();
-    updateMetrics();
-    if (pendingStepCount > 0) drainStepQueue();
+    try {
+      const nextProfile = webglSim.step(count);
+      profile = {
+        ...profile,
+        ...webglSim.profile,
+        stepSimulationMs: nextProfile.stepSimulationMs,
+        colorizeMs: 0,
+        updateFieldBufferMs: 0,
+        patches: 0,
+      };
+      const nextMetrics = webglSim.readMetrics(performance.now());
+      if (nextMetrics) metrics = nextMetrics;
+      simTime += currentStepDt() * nextProfile.steps;
+      simStepCount += nextProfile.steps;
+      requestRender();
+      updateMetrics();
+      if (pendingStepCount > 0) drainStepQueue();
+    } catch (error) {
+      console.error(error);
+      pendingStepCount = Math.min(8, pendingStepCount + count);
+      switchFromWebglToCpu(simulationModel(), { reason: String(error?.message || error) });
+    }
     return;
   }
 
@@ -3096,7 +2812,7 @@ function drainStepQueue() {
     count,
     safeRect: ui.wrapToggle.checked
       ? { left: 0, top: 0, right: worldWidth, bottom: worldHeight }
-      : getActiveRect(currentSafeArea() + currentRadius() + 2),
+        : getActiveRect(currentSafeArea() + maximumRuleRadius() + 2),
   });
 }
 
@@ -3105,6 +2821,24 @@ function bindEvents() {
   ui.timeTabBtn.addEventListener("click", () => setTab("time"));
   ui.gameTabBtn.addEventListener("click", () => setTab("game"));
   ui.advancedTabBtn.addEventListener("click", () => setTab("advanced"));
+  const tabEntries = [
+    { name: "time", button: ui.timeTabBtn },
+    { name: "game", button: ui.gameTabBtn },
+    { name: "advanced", button: ui.advancedTabBtn },
+  ];
+  tabEntries.forEach((entry, index) => {
+    entry.button.addEventListener("keydown", (event) => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      const nextIndex = event.key === "Home"
+        ? 0
+        : event.key === "End"
+          ? tabEntries.length - 1
+          : (index + (event.key === "ArrowRight" ? 1 : -1) + tabEntries.length) % tabEntries.length;
+      setTab(tabEntries[nextIndex].name);
+      tabEntries[nextIndex].button.focus();
+    });
+  });
   ui.runBtn.addEventListener("click", () => setRunning(!isRunning));
   ui.stepBtn.addEventListener("click", () => queueSteps(1));
   ui.clearBtn.addEventListener("click", clearField);
@@ -3136,13 +2870,13 @@ function bindEvents() {
     ui.dtSlider,
     ui.gainSlider,
     ui.decaySlider,
-    ui.safeSlider,
   ]) {
     slider.addEventListener("input", () => {
       syncLabels();
-      configureBackend();
+      scheduleBackendConfiguration();
     });
   }
+  ui.safeSlider.addEventListener("input", syncLabels);
 
   ui.limitToggle.addEventListener("change", configureBackend);
   ui.wrapToggle.addEventListener("change", configureBackend);
@@ -3207,7 +2941,13 @@ function bindEvents() {
       rebuildPalette();
     });
   }
-  ui.formSearch.addEventListener("input", renderFormList);
+  ui.formSearch.addEventListener("input", () => {
+    cancelAnimationFrame(formSearchFrame);
+    formSearchFrame = requestAnimationFrame(() => {
+      formSearchFrame = 0;
+      renderFormList();
+    });
+  });
   ui.collectionSelect.addEventListener("change", () => requestCollectionChange(Number(ui.collectionSelect.value)));
   ui.groupSelect.addEventListener("change", () => requestGroupChange(Number(ui.groupSelect.value)));
   ui.prevGroupBtn.addEventListener("click", () => moveGroup(-1));
@@ -3217,12 +2957,27 @@ function bindEvents() {
     const collectionIndex = pendingCollectionIndex;
     const groupIndex = pendingGroupIndex;
     setGroupAlertDisabled(ui.skipGroupAlert.checked);
-    ui.groupChangeDialog.hidden = true;
-    ui.skipGroupAlert.checked = false;
+    hideGroupChangeDialog();
     commitCatalogSelection(collectionIndex, groupIndex);
   });
   ui.groupChangeDialog.addEventListener("click", (event) => {
     if (event.target === ui.groupChangeDialog) hideGroupChangeDialog();
+  });
+  ui.groupChangeDialog.addEventListener("keydown", (event) => {
+    if (event.key !== "Tab") return;
+    const focusable = [...ui.groupChangeDialog.querySelectorAll(
+      'button:not([disabled]), input:not([disabled]), select:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+    )].filter((element) => !element.hidden);
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
   });
 
   ui.scaleDownBtn.addEventListener("click", () => {
@@ -3257,6 +3012,47 @@ function bindEvents() {
   canvas.addEventListener("pointercancel", handlePointerUp);
   canvas.addEventListener("contextmenu", (event) => event.preventDefault());
   canvas.addEventListener("wheel", handleWheel, { passive: false });
+  canvas.addEventListener("keydown", (event) => {
+    const directions = {
+      ArrowLeft: [-1, 0],
+      ArrowRight: [1, 0],
+      ArrowUp: [0, -1],
+      ArrowDown: [0, 1],
+    };
+    if (directions[event.key]) {
+      event.preventDefault();
+      event.stopPropagation();
+      const distance = (event.shiftKey ? 64 : 16) / Math.max(0.65, camera.scale);
+      camera.x += directions[event.key][0] * distance;
+      camera.y += directions[event.key][1] * distance;
+      clampCamera();
+      requestRender();
+    } else if (event.key === "+" || event.key === "=") {
+      event.preventDefault();
+      event.stopPropagation();
+      camera.scale = clamp(camera.scale * 1.12, 0.65, 64);
+      requestRender();
+    } else if (event.key === "-") {
+      event.preventDefault();
+      event.stopPropagation();
+      camera.scale = clamp(camera.scale / 1.12, 0.65, 64);
+      requestRender();
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      event.stopPropagation();
+      const center = { x: camera.x, y: camera.y };
+      if (currentTool === "form") {
+        if (pendingPlacement) commitPendingPlacement();
+        else placePendingAt(center);
+      } else if (currentTool !== "pan") {
+        paintAt(center);
+      }
+    }
+  });
+  glCanvas.addEventListener("webglcontextlost", (event) => {
+    event.preventDefault();
+    if (usingWebgl()) switchFromWebglToCpu(simulationModel(), { reason: "WebGL context was lost." });
+  });
   window.addEventListener("resize", resizeCanvas);
 
   window.addEventListener("keydown", (event) => {
@@ -3356,6 +3152,7 @@ async function boot() {
     renderFormList();
   }
   setGameZoom(Number(ui.gameZoomSlider.value));
+  setTab("time");
   syncLabels();
   syncGameModeButton();
   syncSelectedLayerControls();

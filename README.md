@@ -2,45 +2,103 @@
 
 ![Lifeform preview](./assets/lifeforms/lifeform-4-o2-a.png)
 
-A small, dependency-free browser playground inspired by Lenia. It includes a live field canvas, growth/kernel views, mass tracing, presets, drawing tools, a searchable library from the original Lenia lifeforms, and core parameters for the continuous cellular automata loop.
+Leniency is a dependency-free browser laboratory for Lenia-style continuous cellular automata. It ships with two interfaces that share the same catalogue and rule model:
 
-The large-field playground is in `range-playground.html`. That path is optimized for sparse lifeforms in a big world: simulation runs in a Web Worker, the field is split into 32 x 32 chunks, inactive chunks outside the safe viewport are dropped, field colors use a lookup table, and only dirty chunk patches are uploaded to the visible buffer.
+- `index.html` is a compact, guided playground with field, growth, kernel, mass trace, presets, and brush tools.
+- `range-playground.html` is an immersive large-world editor with CPU Worker and WebGL backends, layers, compatible rule groups, game-style navigation, and versioned map files.
 
-## Run
+The application uses plain JavaScript, HTML, and CSS. There is no production build step and no third-party runtime dependency.
 
-Open `index.html` directly, or serve the folder:
+## Run locally
+
+Node.js 18 or newer is used for project scripts and tests. Python is used only for the local static server command.
 
 ```powershell
 npm run dev
 ```
 
-Then visit `http://127.0.0.1:5173`.
+Then open:
 
-Open `http://127.0.0.1:5173/range-playground.html` for the optimized large-world version.
+- `http://127.0.0.1:5173/` for the compact playground.
+- `http://127.0.0.1:5173/range-playground.html` for the large-world playground.
 
-## Project layout
+The compact page can also be opened directly from disk. The range playground must be served over HTTP because it loads a Web Worker and compatibility data.
+
+## Controls
+
+Both playgrounds support pointer, touch, and keyboard operation. Buttons expose their selected and running states to assistive technology, and all controls have visible keyboard focus.
+
+Compact playground shortcuts:
+
+- `Space`: run or pause.
+- `R`: reset the selected preset.
+- `N`: randomize the field.
+
+Range playground shortcuts:
+
+- `Space`: run or pause when focus is outside a form control.
+- `Enter`: commit a pending lifeform placement.
+- `Escape`: cancel placement, close a dialog, or exit game mode.
+- `W`, `A`, `S`, `D`: move in game mode.
+
+## Architecture
 
 ```text
-Leniency/
-  index.html
-  package.json
-  src/
-    app.js
-    range-playground.js
-    range-sim-worker.js
-    lenia-lifeforms.js
-    styles.css
+index.html
+  lenia-core.js ── shared codec, rules, curves, palettes
+  lifeform-catalog.js ── catalogue normalization and compatible groups
+  simple-sim.js ── compact typed-array simulation engine
+  app.js ── compact UI orchestration and rendering
+
+range-playground.html
+  shared core/catalogue/map modules
+  range-playground.js ── UI, viewport, layers, and backend controller
+  range-sim-worker.js ── chunked CPU simulation
+  webgl-sim.js ── WebGL2 ping-pong texture simulation
 ```
 
-The simulation is intentionally plain JavaScript so the algorithm is easy to inspect and replace. Favorites are saved in browser `localStorage`.
+Generated catalogue arrays remain separate from application logic. `assets/lifeforms/` contains deterministic previews produced by the image-generation script.
 
-## Profiling
+The CPU range backend divides the field into 32 × 32 chunks, keeps activity metadata per layer, and transfers only dirty color patches. The WebGL backend packs up to three layers into float textures and falls back to the Worker backend when the model or device cannot support it.
 
-The optimized playground reports separate timings for:
+## Map files
 
-- `Step sim`: worker-side Lenia convolution and growth update.
-- `Colorize`: worker-side dirty chunk conversion through the color lookup table.
-- `Buffer`: main-thread `putImageData` updates into the field buffer.
-- `Render`: final viewport draw from the field buffer to the screen canvas.
+Range maps are versioned JSON documents containing the world dimensions, normalized model configuration, and Base64-encoded `Float32` layer data. Loading validates the format, dimensions, channel/rule limits, encodings, decoded lengths, and finite cell values before application state is changed. The current world limit is 2048 × 2048 with up to three layers.
 
-If the radius grows much beyond the current direct-convolution use case, the next major performance step should be a WebGL ping-pong texture implementation. FFT convolution is still likely unnecessary for the current R=13-style kernels.
+Treat map files as data, not scripts. Malformed, oversized, or unsupported files are rejected with an in-app status message.
+
+## Development commands
+
+```powershell
+npm test                 # Run the Node test suite
+npm run check:syntax     # Parse every JavaScript source, script, and test
+npm run check            # Syntax checks plus the full test suite
+npm run generate:lifeforms
+npm run extract:lifeforms
+```
+
+`extract:lifeforms` reads `Python/animals.json` from a local Lenia checkout. Set `LENIA_REPOSITORY` when the checkout is not adjacent to this project:
+
+```powershell
+$env:LENIA_REPOSITORY = "D:\path\to\Lenia"
+npm run extract:lifeforms
+```
+
+`generate:lifeforms` rebuilds deterministic PNG previews from the bundled, compatible-extra, and repository catalogues.
+
+## Verification
+
+The automated suite covers:
+
+- ZIP, ZIP2, CSV, and RLE cell decoding.
+- Rule parsing, kernel/growth math, and catalogue normalization.
+- Every bundled lifeform and generated preview reference.
+- Compatible-group reconciliation.
+- Map validation and round trips.
+- Worker wrapping and snapshot behavior, including kernels larger than the world.
+
+Before shipping a change, run `npm run check` and verify both pages at desktop and phone breakpoints. WebGL behavior should be checked on a WebGL2-capable browser as well as with the CPU backend forced.
+
+## Project data
+
+Research references and the strict compatibility grouping source are stored in `docs/`. Sample maps live in `assets/maps/`. Generated files identify their source script in their header; edit the generator or source data instead of hand-editing generated catalogue output.

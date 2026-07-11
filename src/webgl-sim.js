@@ -3,6 +3,7 @@
   const MAX_CHANNELS = 3;
   const MAX_RENDER_CHANNELS = MAX_CHANNELS;
   const MAX_RULES = 8;
+  const MAX_RULE_RADIUS = 64;
   const DEFAULT_COLORS = ["#080618", "#231c49", "#3e3f77", "#8889bc", "#f0efd6"];
   const DEFAULT_RULE = {
     id: "rule-0",
@@ -52,6 +53,8 @@
       this.metricScope = "selected";
       this.metrics = emptyMetrics(this.selectedChannelId, this.metricScope);
       this.lastMetricReadAt = 0;
+      this.metricElapsedTime = 0;
+      this.metricMassBaseline = new Map();
       this.profile = {
         stepSimulationMs: 0,
         colorizeMs: 0,
@@ -83,19 +86,9 @@
       this.emptyKernelTexture = this.createKernelTexture(new Float32Array([0, 0, 0, 0]), 1);
     }
 
-    static isSupported(canvas) {
-      try {
-        const sim = new WebGLLeniaSim(canvas);
-        sim.dispose();
-        return { supported: true, reason: "" };
-      } catch (error) {
-        return { supported: false, reason: String(error?.message || error) };
-      }
-    }
-
     init(width, height, modelOrConfig, colors) {
-      this.width = Math.max(1, Math.floor(width || 1));
-      this.height = Math.max(1, Math.floor(height || 1));
+      this.width = this.validateDimension(width, "width");
+      this.height = this.validateDimension(height, "height");
       this.replaceStateTextures(this.width, this.height);
       this.setModel(modelOrConfig?.channels ? modelOrConfig : legacyModel(modelOrConfig, colors), { preserve: false });
       this.clear();
@@ -122,14 +115,6 @@
         if (program) gl.deleteProgram(program);
       }
       if (this.vao) gl.deleteVertexArray(this.vao);
-    }
-
-    setConfig(config) {
-      const model = currentModel(this);
-      const selectedRule = model.rules.find((rule) => rule.destinationChannelId === this.selectedChannelId) || model.rules[0];
-      if (selectedRule) Object.assign(selectedRule, config || {});
-      model.wrapAround = config?.wrapAround !== false;
-      this.setModel(model);
     }
 
     setModel(model, { preserve = true } = {}) {
@@ -185,12 +170,6 @@
       this.markFullSimulation();
     }
 
-    setPalette(colors) {
-      const channel = this.channels[0];
-      if (!channel) return;
-      channel.palette = colors && colors.length ? colors : DEFAULT_COLORS;
-    }
-
     resize(width, height) {
       const oldWidth = this.width;
       const oldHeight = this.height;
@@ -198,8 +177,8 @@
       const oldFramebuffers = this.stateFramebuffers;
       const oldTexture = this.sourceTexture();
 
-      this.width = Math.max(1, Math.floor(width || 1));
-      this.height = Math.max(1, Math.floor(height || 1));
+      this.width = this.validateDimension(width, "width");
+      this.height = this.validateDimension(height, "height");
       this.stateTextures = [this.createFieldTexture(this.width, this.height), this.createFieldTexture(this.width, this.height)];
       this.stateFramebuffers = this.stateTextures.map((texture) => this.createFramebuffer(texture));
       this.sourceIndex = 0;
@@ -218,6 +197,8 @@
       for (const framebuffer of oldFramebuffers) gl.deleteFramebuffer(framebuffer);
       for (const rule of this.rules) this.rebuildKernel(rule);
       this.metrics = emptyMetrics(this.selectedChannelId, this.metricScope);
+      this.metricElapsedTime = 0;
+      this.metricMassBaseline.clear();
       this.markFullSimulation();
     }
 
@@ -233,6 +214,8 @@
         });
       }
       this.metrics = emptyMetrics(this.selectedChannelId, this.metricScope);
+      this.metricElapsedTime = 0;
+      this.metricMassBaseline.clear();
       this.profile = { ...this.profile, activeChunks: 0, simChunks: 0, patches: 0 };
     }
 
@@ -355,6 +338,9 @@
       gl.bindTexture(gl.TEXTURE_2D, this.sourceTexture());
       gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, this.width, this.height, gl.RGBA, gl.FLOAT, packed);
       this.clearTexture(this.destinationTexture(), this.destinationFramebuffer());
+      this.metrics = emptyMetrics(this.selectedChannelId, this.metricScope);
+      this.metricElapsedTime = 0;
+      this.metricMassBaseline.clear();
       this.markFullSimulation();
     }
 
@@ -399,6 +385,7 @@
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.flush();
       const stepMs = performance.now() - start;
+      this.metricElapsedTime += this.rules.reduce((maximum, rule) => Math.max(maximum, rule.dt || 0), 0) * stepCount;
       this.markFullSimulation();
       this.profile.stepSimulationMs = stepMs;
       return {
@@ -427,9 +414,14 @@
         }
         const channelMetrics = {
           mass: mass / (this.width * this.height),
-          growth: this.metrics.perChannel?.[channel.id]?.growth || 0,
+          growth: 0,
           energy: energy / (this.width * this.height),
         };
+        const baseline = this.metricMassBaseline.get(channel.id);
+        channelMetrics.growth = baseline != null && this.metricElapsedTime > 0
+          ? (channelMetrics.mass - baseline) / this.metricElapsedTime
+          : this.metrics.perChannel?.[channel.id]?.growth || 0;
+        this.metricMassBaseline.set(channel.id, channelMetrics.mass);
         perChannel[channel.id] = channelMetrics;
         if (channel.visible !== false) {
           aggregateMass += channelMetrics.mass;
@@ -448,6 +440,7 @@
         aggregate,
         ...(this.metricScope === "aggregate" ? aggregate : perChannel[this.selectedChannelId] || aggregate),
       };
+      this.metricElapsedTime = 0;
       return this.metrics;
     }
 
@@ -489,6 +482,15 @@
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, width, height, 0, gl.RGBA, gl.FLOAT, null);
       return texture;
+    }
+
+    validateDimension(value, label) {
+      const dimension = Math.floor(Number(value));
+      const maximum = this.gl.getParameter(this.gl.MAX_TEXTURE_SIZE);
+      if (!Number.isFinite(dimension) || dimension < 1 || dimension > maximum) {
+        throw new RangeError(`WebGL world ${label} must be between 1 and ${maximum}`);
+      }
+      return dimension;
     }
 
     createKernelTexture(data, count) {
@@ -1245,7 +1247,9 @@ void main() {
       visible: channel.visible !== false,
     }));
     const ids = new Set(channels.map((channel) => channel.id));
+    if (ids.size !== channels.length) throw new TypeError("Channel ids must be unique");
     const sourceRules = Array.isArray(model.rules) && model.rules.length ? model.rules : [model.rule || DEFAULT_RULE];
+    if (sourceRules.length > MAX_RULES) throw new RangeError(`WebGL v1 supports up to ${MAX_RULES} rules`);
     const rules = sourceRules.map((rule, index) => {
       const fallbackId = channels[0]?.id || "channel-0";
       const sourceId = String(rule.sourceChannelId || rule.src || rule.source || fallbackId);
@@ -1320,20 +1324,20 @@ void main() {
       id: String(rule.id || "rule-0"),
       sourceChannelId: String(rule.sourceChannelId || rule.source || "channel-0"),
       destinationChannelId: String(rule.destinationChannelId || rule.destination || "channel-0"),
-      radius: Number(rule.radius ?? 13),
-      alpha: Number(rule.alpha ?? 4),
-      mu: Number(rule.mu ?? 0.15),
-      sigma: Number(rule.sigma ?? 0.017),
-      dt: Number(rule.dt ?? 0.1),
-      gain: Number(rule.gain ?? 1),
-      decay: Number(rule.decay ?? 0),
+      radius: finiteNumber(rule.radius ?? 13, "Rule radius", 1, MAX_RULE_RADIUS),
+      alpha: finiteNumber(rule.alpha ?? 4, "Rule alpha", 0.01, 64),
+      mu: finiteNumber(rule.mu ?? 0.15, "Rule mu", -4, 4),
+      sigma: finiteNumber(rule.sigma ?? 0.017, "Rule sigma", Number.EPSILON, 4),
+      dt: finiteNumber(rule.dt ?? 0.1, "Rule time step", 0.000001, 4),
+      gain: finiteNumber(rule.gain ?? 1, "Rule gain", -16, 16),
+      decay: finiteNumber(rule.decay ?? 0, "Rule decay", 0, 4),
       limitValue: rule.limitValue !== false,
       deltaName: rule.deltaName || "gaus",
       coreName: rule.coreName || "bump4",
       layer: Number(rule.layer || 0),
       beta: [...(rule.beta || [1, 0, 0, 0])],
       eta: [...(rule.eta || [0, 0, 0, 0])],
-      weight: Number(rule.weight ?? 1),
+      weight: finiteNumber(rule.weight ?? 1, "Rule weight", -16, 16),
       positiveOnly: Boolean(rule.positiveOnly),
       kernelTexture: null,
       kernelCount: 0,
@@ -1476,6 +1480,14 @@ void main() {
 
   function clamp(value, low = 0, high = 1) {
     return Math.max(low, Math.min(high, value));
+  }
+
+  function finiteNumber(value, label, low, high) {
+    const number = Number(value);
+    if (!Number.isFinite(number) || number < low || number > high) {
+      throw new RangeError(`${label} must be between ${low} and ${high}`);
+    }
+    return number;
   }
 
   window.WebGLLeniaSim = WebGLLeniaSim;

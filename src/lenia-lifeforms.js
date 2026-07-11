@@ -1,4 +1,3 @@
-const DEFAULT_ANIMAL = "O2(a)";
 var animalArr = [
 [">1", "class: Exokernel", "外核綱 ソトカク"],
 [">2", "order: Orbiformes", "球形目 タマムシ"],

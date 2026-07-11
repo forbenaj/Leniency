@@ -2,6 +2,9 @@ const CHUNK_SIZE = 32;
 const EPSILON = 0.00001;
 const GROWTH_LUT_SIZE = 4096;
 const MAX_CHANNELS = 3;
+const MAX_RULES = 16;
+const MAX_RULE_RADIUS = 64;
+const MAX_WORLD_SIZE = 2048;
 const DEFAULT_COLORS = ["#080618", "#231c49", "#3e3f77", "#8889bc", "#f0efd6"];
 const DEFAULT_RULE = {
   id: "rule-0",
@@ -37,18 +40,16 @@ let metricScope = "selected";
 let simTime = 0;
 let metrics = emptyMetrics();
 let lastGrowthByChannel = new Map();
+let protocolRevision = 0;
 
 self.onmessage = (event) => {
-  const message = event.data;
+  const message = event.data || {};
   try {
+    if (message.type !== "step" && Number.isSafeInteger(message.revision)) protocolRevision = message.revision;
     if (message.type === "init") {
       initWorld(message.width, message.height, message.model || legacyModel(message.config, message.colors));
     } else if (message.type === "model") {
       setModel(message.model);
-    } else if (message.type === "config") {
-      setModel(legacyModel(message.config, message.colors));
-    } else if (message.type === "palette") {
-      setLegacyPalette(message.colors);
     } else if (message.type === "resize") {
       resizeWorld(message.width, message.height);
     } else if (message.type === "clear") {
@@ -66,20 +67,27 @@ self.onmessage = (event) => {
     } else if (message.type === "loadSnapshot") {
       loadSnapshot(message.snapshot);
     } else if (message.type === "step") {
-      stepMany(message.count, normalizeRect(message.safeRect));
+      stepMany(message.count, normalizeRect(message.safeRect), message.revision);
+    } else {
+      throw new TypeError(`Unknown worker message type "${String(message.type || "")}".`);
     }
   } catch (error) {
-    self.postMessage({ type: "error", message: String(error?.message || error) });
+    self.postMessage({
+      type: "error",
+      requestId: message.requestId,
+      revision: Number.isSafeInteger(message.revision) ? message.revision : protocolRevision,
+      message: String(error?.message || error),
+    });
   }
 };
 
 function initWorld(width, height, model) {
-  worldWidth = width || worldWidth;
-  worldHeight = height || worldHeight;
+  worldWidth = normalizeWorldDimension(width, "width");
+  worldHeight = normalizeWorldDimension(height, "height");
   updateChunkGrid();
-  setModel(model || legacyModel());
+  setModel(model || legacyModel(), { post: false });
   clearWorld(false);
-  self.postMessage({ type: "ready" });
+  self.postMessage({ type: "ready", revision: protocolRevision });
   postFrame({ reset: true });
 }
 
@@ -113,15 +121,7 @@ function legacyModel(config = DEFAULT_RULE, colors = DEFAULT_COLORS) {
   };
 }
 
-function setLegacyPalette(colors) {
-  const channel = channels[0];
-  if (!channel) return;
-  channel.palette = (colors && colors.length ? colors : DEFAULT_COLORS).map(String);
-  rebuildColorLut(channel);
-  postFrame({ reset: true, dirtyChunks: allChunks() });
-}
-
-function setModel(nextModel = {}) {
+function setModel(nextModel = {}, { post = true } = {}) {
   const normalized = normalizeModel(nextModel);
   const previous = channelMap;
   const nextChannels = [];
@@ -156,7 +156,7 @@ function setModel(nextModel = {}) {
     rebuildChannelActivity(channel);
   }
   measureMetrics();
-  postFrame({ reset: true, dirtyChunks: allChunks() });
+  if (post) postFrame({ reset: true, dirtyChunks: allChunks() });
 }
 
 function normalizeModel(model = {}) {
@@ -168,7 +168,9 @@ function normalizeModel(model = {}) {
     visible: channel.visible !== false,
   }));
   const ids = new Set(normalizedChannels.map((channel) => channel.id));
+  if (ids.size !== normalizedChannels.length) throw new TypeError("Channel ids must be unique.");
   const sourceRules = Array.isArray(model.rules) && model.rules.length ? model.rules : [model.rule || DEFAULT_RULE];
+  if (sourceRules.length > MAX_RULES) throw new RangeError(`CPU backend supports up to ${MAX_RULES} rules.`);
   const normalizedRules = sourceRules.map((rule, index) => {
     const fallbackId = normalizedChannels[0]?.id || "channel-0";
     const sourceId = String(rule.sourceChannelId || rule.src || rule.source || fallbackId);
@@ -190,24 +192,32 @@ function normalizeModel(model = {}) {
 }
 
 function normalizeRule(rule = {}) {
+  const radius = finiteNumber(rule.radius ?? 13, "Rule radius", 1, MAX_RULE_RADIUS);
+  const alpha = finiteNumber(rule.alpha ?? 4, "Rule alpha", 0.01, 64);
+  const mu = finiteNumber(rule.mu ?? 0.15, "Rule mu", -4, 4);
+  const sigma = finiteNumber(rule.sigma ?? 0.017, "Rule sigma", Number.EPSILON, 4);
+  const dt = finiteNumber(rule.dt ?? 0.1, "Rule time step", 0.000001, 4);
+  const gain = finiteNumber(rule.gain ?? 1, "Rule gain", -16, 16);
+  const decay = finiteNumber(rule.decay ?? 0, "Rule decay", 0, 4);
+  const weight = finiteNumber(rule.weight ?? 1, "Rule weight", -16, 16);
   return {
     id: String(rule.id || "rule-0"),
     sourceChannelId: String(rule.sourceChannelId || rule.source || "channel-0"),
     destinationChannelId: String(rule.destinationChannelId || rule.destination || "channel-0"),
-    radius: Number(rule.radius ?? 13),
-    alpha: Number(rule.alpha ?? 4),
-    mu: Number(rule.mu ?? 0.15),
-    sigma: Number(rule.sigma ?? 0.017),
-    dt: Number(rule.dt ?? 0.1),
-    gain: Number(rule.gain ?? 1),
-    decay: Number(rule.decay ?? 0),
+    radius,
+    alpha,
+    mu,
+    sigma,
+    dt,
+    gain,
+    decay,
     limitValue: rule.limitValue !== false,
     deltaName: rule.deltaName || "gaus",
     coreName: rule.coreName || "bump4",
     layer: Number(rule.layer || 0),
     beta: [...(rule.beta || [1, 0, 0, 0])],
     eta: [...(rule.eta || [0, 0, 0, 0])],
-    weight: Number(rule.weight ?? 1),
+    weight,
     positiveOnly: Boolean(rule.positiveOnly),
     kernelOx: new Int16Array(0),
     kernelOy: new Int16Array(0),
@@ -265,8 +275,8 @@ function resizeWorld(width, height) {
   const oldWidth = worldWidth;
   const oldHeight = worldHeight;
   const oldFields = new Map(channels.map((channel) => [channel.id, channel.field]));
-  worldWidth = width;
-  worldHeight = height;
+  worldWidth = normalizeWorldDimension(width, "width");
+  worldHeight = normalizeWorldDimension(height, "height");
   updateChunkGrid();
   for (const channel of channels) resizeChannel(channel, oldWidth, oldHeight, oldFields.get(channel.id));
   for (const rule of rules) rebuildKernel(rule);
@@ -437,7 +447,7 @@ function sampleAt(x, y, channelId, scope, requestId) {
       value = channel?.field[index] || 0;
     }
   }
-  self.postMessage({ type: "sample", requestId, value });
+  self.postMessage({ type: "sample", requestId, revision: protocolRevision, value });
 }
 
 function postSnapshot(requestId) {
@@ -460,6 +470,7 @@ function postSnapshot(requestId) {
     {
       type: "snapshot",
       requestId,
+      revision: protocolRevision,
       width: worldWidth,
       height: worldHeight,
       channels: snapshotChannels,
@@ -473,14 +484,15 @@ function postSnapshot(requestId) {
 
 function loadSnapshot(snapshot = {}) {
   if (snapshot.width && snapshot.height && (snapshot.width !== worldWidth || snapshot.height !== worldHeight)) {
-    worldWidth = snapshot.width;
-    worldHeight = snapshot.height;
+    worldWidth = normalizeWorldDimension(snapshot.width, "snapshot.width");
+    worldHeight = normalizeWorldDimension(snapshot.height, "snapshot.height");
     updateChunkGrid();
     channels = [];
     channelMap = new Map();
   }
-  if (snapshot.model) setModel(snapshot.model);
-  else if (!channels.length) setModel(legacyModel());
+  if (snapshot.model) setModel(snapshot.model, { post: false });
+  else if (!channels.length) setModel(legacyModel(), { post: false });
+  for (const channel of channels) clearChannel(channel, false);
   const incoming = Array.isArray(snapshot.channels)
     ? snapshot.channels
     : [{ id: channels[0]?.id || "channel-0", values: snapshot.values }];
@@ -490,7 +502,7 @@ function loadSnapshot(snapshot = {}) {
     const values = item.values instanceof Float32Array ? item.values : new Float32Array(item.values);
     if (values.length !== worldWidth * worldHeight) continue;
     channel.field.set(values);
-    channel.next.fill(0);
+    channel.next.set(values);
     rebuildChannelActivity(channel);
     channel.fieldTouchedChunks = new Set(channel.activeChunks);
   }
@@ -499,7 +511,7 @@ function loadSnapshot(snapshot = {}) {
   postFrame({ reset: true, dirtyChunks: allChunks() });
 }
 
-function stepMany(count, safeRect) {
+function stepMany(count, safeRect, requestedRevision = protocolRevision) {
   const stepStart = performance.now();
   let dirtyChunks = new Set();
   let simChunksTotal = 0;
@@ -511,6 +523,7 @@ function stepMany(count, safeRect) {
     simChunksTotal += result.simChunks;
   }
 
+  measureMetrics();
   const stepMs = performance.now() - stepStart;
   postFrame({
     dirtyChunks,
@@ -521,6 +534,7 @@ function stepMany(count, safeRect) {
       activeChunks: totalActiveChunks(),
       simChunks: Math.round(simChunksTotal / stepCount),
     },
+    revision: Number.isSafeInteger(requestedRevision) ? requestedRevision : protocolRevision,
   });
 }
 
@@ -578,17 +592,14 @@ function stepOnce(safeRect) {
   for (const [channelId, total] of growthTotals) {
     lastGrowthByChannel.set(channelId, total / (worldWidth * worldHeight));
   }
-  for (const channel of channels) {
-    channel.next.set(channel.field);
-  }
   simTime += maxRuleDt();
-  measureMetrics();
   return { dirtyChunks, simChunks: simChunks.size };
 }
 
 function applyRuleContribution(rule, source, dest, simChunks, safeRect, growthTotals) {
   let growthTotal = growthTotals.get(dest.id) || 0;
   const weight = Number.isFinite(rule.weight) ? rule.weight : 1;
+  const needsFullModulo = rule.radius >= worldWidth || rule.radius >= worldHeight;
   for (const chunkId of simChunks) {
     const bounds = intersectRects(chunkBounds(chunkId), safeRect);
     if (!bounds) continue;
@@ -601,10 +612,15 @@ function applyRuleContribution(rule, source, dest, simChunks, safeRect, growthTo
           for (let k = 0; k < rule.kernelWeight.length; k += 1) {
             let sx = x + rule.kernelOx[k];
             let sy = y + rule.kernelOy[k];
-            if (sx < 0) sx += worldWidth;
-            else if (sx >= worldWidth) sx -= worldWidth;
-            if (sy < 0) sy += worldHeight;
-            else if (sy >= worldHeight) sy -= worldHeight;
+            if (needsFullModulo) {
+              sx = modulo(sx, worldWidth);
+              sy = modulo(sy, worldHeight);
+            } else {
+              if (sx < 0) sx += worldWidth;
+              else if (sx >= worldWidth) sx -= worldWidth;
+              if (sy < 0) sy += worldHeight;
+              else if (sy >= worldHeight) sy -= worldHeight;
+            }
             neighborhood += source.field[sy * worldWidth + sx] * rule.kernelWeight[k];
           }
         } else {
@@ -647,8 +663,24 @@ function finalizeDestination(channel, chunks, rulesForChannel, safeRect) {
 function buildSimulationChunks(sourceChunks, safeRect, rule) {
   const result = new Set();
   if (!sourceChunks.size) return result;
-  if (wrapAround) return chunksForRect(safeRect);
   const radius = Math.ceil(rule.radius);
+
+  if (wrapAround) {
+    const chunkReach = Math.ceil(radius / CHUNK_SIZE);
+    for (const chunkId of sourceChunks) {
+      const sourceX = chunkId % chunksX;
+      const sourceY = Math.floor(chunkId / chunksX);
+      for (let offsetY = -chunkReach; offsetY <= chunkReach; offsetY += 1) {
+        for (let offsetX = -chunkReach; offsetX <= chunkReach; offsetX += 1) {
+          const chunkX = modulo(sourceX + offsetX, chunksX);
+          const chunkY = modulo(sourceY + offsetY, chunksY);
+          const nextId = chunkY * chunksX + chunkX;
+          if (intersectRects(chunkBounds(nextId), safeRect)) result.add(nextId);
+        }
+      }
+    }
+    return result;
+  }
 
   for (const chunkId of sourceChunks) {
     const bounds = chunkBounds(chunkId);
@@ -757,7 +789,13 @@ function emptyMetrics() {
   };
 }
 
-function postFrame({ dirtyChunks = new Set(), reset = false, stepped = false, profile: nextProfile = null } = {}) {
+function postFrame({
+  dirtyChunks = new Set(),
+  reset = false,
+  stepped = false,
+  profile: nextProfile = null,
+  revision = protocolRevision,
+} = {}) {
   const chunks = reset ? allChunks() : dirtyChunks;
   const patches = [];
   const transfers = [];
@@ -774,6 +812,7 @@ function postFrame({ dirtyChunks = new Set(), reset = false, stepped = false, pr
   self.postMessage(
     {
       type: "frame",
+      revision,
       reset,
       stepped,
       patches,
@@ -813,20 +852,22 @@ function renderChunk(chunkId) {
         pixels[p + 1] = single.colorLut[lutIndex + 1];
         pixels[p + 2] = single.colorLut[lutIndex + 2];
       } else {
-        const color = [...background];
+        let red = background[0];
+        let green = background[1];
+        let blue = background[2];
         for (const channel of visibleChannels) {
           const value = clamp(channel.field[row + x]);
           if (value <= EPSILON) continue;
           const valueIndex = Math.max(0, Math.min(255, Math.round(value * 255)));
           const lutIndex = valueIndex * 3;
           const alpha = clamp(value * 0.86);
-          color[0] = color[0] * (1 - alpha) + channel.colorLut[lutIndex] * alpha;
-          color[1] = color[1] * (1 - alpha) + channel.colorLut[lutIndex + 1] * alpha;
-          color[2] = color[2] * (1 - alpha) + channel.colorLut[lutIndex + 2] * alpha;
+          red = red * (1 - alpha) + channel.colorLut[lutIndex] * alpha;
+          green = green * (1 - alpha) + channel.colorLut[lutIndex + 1] * alpha;
+          blue = blue * (1 - alpha) + channel.colorLut[lutIndex + 2] * alpha;
         }
-        pixels[p] = Math.round(color[0]);
-        pixels[p + 1] = Math.round(color[1]);
-        pixels[p + 2] = Math.round(color[2]);
+        pixels[p] = Math.round(red);
+        pixels[p + 1] = Math.round(green);
+        pixels[p + 2] = Math.round(blue);
       }
       pixels[p + 3] = 255;
       p += 4;
@@ -1055,4 +1096,20 @@ function maxRuleDt() {
 
 function totalActiveChunks() {
   return channels.reduce((total, channel) => total + channel.activeChunks.size, 0);
+}
+
+/** @param {unknown} value @param {string} label @param {number} low @param {number} high */
+function finiteNumber(value, label, low, high) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < low || number > high) {
+    throw new RangeError(`${label} must be between ${low} and ${high}.`);
+  }
+  return number;
+}
+
+/** @param {unknown} value @param {string} label */
+function normalizeWorldDimension(value, label) {
+  const number = finiteNumber(value, `World ${label}`, 1, MAX_WORLD_SIZE);
+  if (!Number.isSafeInteger(number)) throw new TypeError(`World ${label} must be an integer.`);
+  return number;
 }
