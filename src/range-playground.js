@@ -128,6 +128,8 @@ const ui = {
   massLabel: document.querySelector("#massLabel"),
   growthLabel: document.querySelector("#growthLabel"),
   energyLabel: document.querySelector("#energyLabel"),
+  toggleMetricsBtn: document.querySelector("#toggleMetricsBtn"),
+  fieldMetricRows: [...document.querySelectorAll("[data-field-metric]")],
   fpsLabel: document.querySelector("#fpsLabel"),
   simFpsLabel: document.querySelector("#simFpsLabel"),
   simMsLabel: document.querySelector("#simMsLabel"),
@@ -252,6 +254,7 @@ let selectedChannelId = "channel-0";
 let nextChannelSerial = 1;
 let nextLayerPaletteIndex = 0;
 let metricScope = "selected";
+let metricsEnabled = true;
 let catalogForms = [];
 let lifeformCollections = [];
 let activeCollectionIndex = -1;
@@ -757,6 +760,7 @@ function simulationModel() {
   return {
     selectedChannelId,
     metricScope,
+    metricsEnabled,
     wrapAround: ui.wrapToggle.checked,
     channels: channels.slice(0, MAX_CHANNELS).map((channel) => ({
       id: channel.id,
@@ -1410,7 +1414,7 @@ function sendBackend(type, payload = {}, transfer = []) {
       ui.sampleLabel.textContent = webglSim.sample(payload.x, payload.y, payload.channelId, payload.scope).toFixed(3);
     } else if (type === "loadSnapshot") {
       webglSim.loadSnapshot(payload.snapshot);
-      metrics = webglSim.readMetrics(performance.now(), true) || webglSim.metrics;
+      if (metricsEnabled) metrics = webglSim.readMetrics(performance.now(), true) || webglSim.metrics;
       profile = { ...profile, ...webglSim.profile };
     } else {
       throw new TypeError(`Unsupported WebGL command "${type}".`);
@@ -1457,6 +1461,9 @@ function syncLabels() {
 }
 
 function updateMetrics() {
+  ui.toggleMetricsBtn.textContent = metricsEnabled ? "Disable field metrics" : "Enable field metrics";
+  ui.toggleMetricsBtn.setAttribute("aria-pressed", String(metricsEnabled));
+  for (const row of ui.fieldMetricRows) row.hidden = !metricsEnabled;
   const scopedMetrics =
     metricScope === "aggregate" ? metrics.aggregate || metrics : metrics.perChannel?.[selectedChannelId] || metrics;
   ui.massLabel.textContent = Number(scopedMetrics.mass || 0).toFixed(4);
@@ -1713,6 +1720,14 @@ function setSelectedLayerSource(sourceChannelId) {
 
 function setMetricScope(value) {
   metricScope = value === "aggregate" ? "aggregate" : "selected";
+  scheduleBackendConfiguration();
+  updateMetrics();
+}
+
+function setMetricsEnabled(value) {
+  metricsEnabled = Boolean(value);
+  if (!metricsEnabled) metrics = { mass: 0, growth: 0, energy: 0 };
+  scheduleBackendConfiguration();
   updateMetrics();
 }
 
@@ -2789,8 +2804,10 @@ function drainStepQueue() {
         updateFieldBufferMs: 0,
         patches: 0,
       };
-      const nextMetrics = webglSim.readMetrics(performance.now());
-      if (nextMetrics) metrics = nextMetrics;
+      if (metricsEnabled) {
+        const nextMetrics = webglSim.readMetrics(performance.now());
+        if (nextMetrics) metrics = nextMetrics;
+      }
       simTime += currentStepDt() * nextProfile.steps;
       simStepCount += nextProfile.steps;
       requestRender();
@@ -2933,6 +2950,7 @@ function bindEvents() {
   ui.layerVisibleToggle.addEventListener("change", () => setSelectedLayerVisible(ui.layerVisibleToggle.checked));
   ui.layerSourceSelect.addEventListener("change", () => setSelectedLayerSource(ui.layerSourceSelect.value));
   ui.metricScopeSelect.addEventListener("change", () => setMetricScope(ui.metricScopeSelect.value));
+  ui.toggleMetricsBtn.addEventListener("click", () => setMetricsEnabled(!metricsEnabled));
   for (const input of ui.layerColorInputs) {
     input.addEventListener("input", () => {
       ui.colorInputs.forEach((colorInput, index) => {

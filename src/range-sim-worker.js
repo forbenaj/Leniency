@@ -37,6 +37,7 @@ let rules = [];
 let wrapAround = true;
 let selectedChannelId = "channel-0";
 let metricScope = "selected";
+let metricsEnabled = true;
 let simTime = 0;
 let metrics = emptyMetrics();
 let lastGrowthByChannel = new Map();
@@ -142,6 +143,7 @@ function setModel(nextModel = {}, { post = true } = {}) {
   channelMap = nextMap;
   selectedChannelId = channelMap.has(normalized.selectedChannelId) ? normalized.selectedChannelId : channels[0]?.id || "channel-0";
   metricScope = normalized.metricScope;
+  metricsEnabled = normalized.metricsEnabled;
   wrapAround = normalized.wrapAround;
   rules = normalized.rules.filter((rule) => channelMap.has(rule.sourceChannelId) && channelMap.has(rule.destinationChannelId));
   if (!rules.length && channels.length) {
@@ -155,7 +157,7 @@ function setModel(nextModel = {}, { post = true } = {}) {
     if (isDiscreteChannel(channel.id)) quantizeChannel(channel);
     rebuildChannelActivity(channel);
   }
-  measureMetrics();
+  if (metricsEnabled) measureMetrics();
   if (post) postFrame({ reset: true, dirtyChunks: allChunks() });
 }
 
@@ -187,6 +189,7 @@ function normalizeModel(model = {}) {
     rules: normalizedRules,
     selectedChannelId: String(model.selectedChannelId || normalizedChannels[0]?.id || "channel-0"),
     metricScope: model.metricScope === "aggregate" ? "aggregate" : "selected",
+    metricsEnabled: model.metricsEnabled !== false,
     wrapAround: model.wrapAround !== false,
   };
 }
@@ -280,7 +283,7 @@ function resizeWorld(width, height) {
   updateChunkGrid();
   for (const channel of channels) resizeChannel(channel, oldWidth, oldHeight, oldFields.get(channel.id));
   for (const rule of rules) rebuildKernel(rule);
-  measureMetrics();
+  if (metricsEnabled) measureMetrics();
   postFrame({ reset: true, dirtyChunks: allChunks() });
 }
 
@@ -324,7 +327,7 @@ function randomizeWorld(rect, channelId = selectedChannelId) {
 
   rebuildChannelActivity(channel);
   channel.fieldTouchedChunks = unionSets(dirtyChunks, channel.activeChunks);
-  measureMetrics();
+  if (metricsEnabled) measureMetrics();
   postFrame({ reset: true, dirtyChunks: unionSets(dirtyChunks, channel.activeChunks) });
 }
 
@@ -476,7 +479,7 @@ function postSnapshot(requestId) {
       channels: snapshotChannels,
       values: snapshotChannels[0]?.values || new ArrayBuffer(0),
       simTime,
-      metrics,
+      metrics: metricsEnabled ? metrics : undefined,
     },
     transfers,
   );
@@ -736,6 +739,7 @@ function quantizeChannel(channel) {
 }
 
 function measureMetrics() {
+  if (!metricsEnabled) return;
   const perChannel = {};
   let aggregateMass = 0;
   let aggregateEnergy = 0;
@@ -816,7 +820,7 @@ function postFrame({
       reset,
       stepped,
       patches,
-      metrics,
+      metrics: metricsEnabled ? metrics : undefined,
       simTime,
       profile: {
         stepSimulationMs: nextProfile?.stepSimulationMs ?? 0,

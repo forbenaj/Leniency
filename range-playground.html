@@ -118,11 +118,12 @@
           <input id="speedSlider" type="range" min="1" max="60" step="1" value="12" />
         </label>
 
+        <button id="toggleMetricsBtn" type="button" aria-pressed="true">Disable field metrics</button>
         <dl class="metrics" aria-label="Simulation metrics">
           <div><dt>Backend</dt><dd><strong id="backendLabel">CPU</strong></dd></div>
-          <div><dt>Mass</dt><dd><strong id="massLabel">0.0000</strong></dd></div>
-          <div><dt>Growth</dt><dd><strong id="growthLabel">0.0000</strong></dd></div>
-          <div><dt>Energy</dt><dd><strong id="energyLabel">0.0000</strong></dd></div>
+          <div data-field-metric><dt>Mass</dt><dd><strong id="massLabel">0.0000</strong></dd></div>
+          <div data-field-metric><dt>Growth</dt><dd><strong id="growthLabel">0.0000</strong></dd></div>
+          <div data-field-metric><dt>Energy</dt><dd><strong id="energyLabel">0.0000</strong></dd></div>
           <div><dt>Render rate</dt><dd><strong id="fpsLabel">0</strong> fps</dd></div>
           <div><dt>Simulation rate</dt><dd><strong id="simFpsLabel">0</strong> steps/s</dd></div>
           <div><dt>Simulation step</dt><dd><strong id="simMsLabel">0.0</strong> ms</dd></div>
