@@ -375,12 +375,11 @@
       gl.uniform1iv(gl.getUniformLocation(this.stepProgram, "uDeltaMode"), uniforms.deltaMode);
       gl.uniform1iv(gl.getUniformLocation(this.stepProgram, "uDestinationActive"), uniforms.destinationActive);
       gl.uniform1iv(gl.getUniformLocation(this.stepProgram, "uDestinationDiscrete"), uniforms.destinationDiscrete);
-      gl.uniform1iv(gl.getUniformLocation(this.stepProgram, "uDestinationLimit"), uniforms.destinationLimit);
       gl.uniform1fv(gl.getUniformLocation(this.stepProgram, "uMu"), uniforms.mu);
       gl.uniform1fv(gl.getUniformLocation(this.stepProgram, "uSigma"), uniforms.sigma);
       gl.uniform1fv(gl.getUniformLocation(this.stepProgram, "uDt"), uniforms.dt);
       gl.uniform1fv(gl.getUniformLocation(this.stepProgram, "uGain"), uniforms.gain);
-      gl.uniform1fv(gl.getUniformLocation(this.stepProgram, "uDecay"), uniforms.decay);
+      gl.uniform1fv(gl.getUniformLocation(this.stepProgram, "uDestinationDecay"), uniforms.destinationDecay);
       gl.uniform1fv(gl.getUniformLocation(this.stepProgram, "uWeight"), uniforms.weight);
       gl.uniform1fv(gl.getUniformLocation(this.stepProgram, "uAlpha"), uniforms.alpha);
 
@@ -578,14 +577,11 @@
       const sigma = new Float32Array(MAX_RULES);
       const dt = new Float32Array(MAX_RULES);
       const gain = new Float32Array(MAX_RULES);
-      const decay = new Float32Array(MAX_RULES);
+      const destinationDecay = new Float32Array(MAX_CHANNELS);
       const weight = new Float32Array(MAX_RULES);
       const alpha = new Float32Array(MAX_RULES);
       const destinationActive = new Int32Array(MAX_CHANNELS);
       const destinationDiscrete = new Int32Array(MAX_CHANNELS);
-      const destinationLimit = new Int32Array(MAX_CHANNELS);
-      destinationLimit.fill(1);
-
       const rulesByDestination = new Map();
       for (let i = 0; i < this.rules.length; i += 1) {
         const rule = this.rules[i];
@@ -601,18 +597,14 @@
         sigma[i] = rule.sigma;
         dt[i] = rule.dt;
         gain[i] = rule.gain;
-        decay[i] = rule.decay;
         weight[i] = rule.weight;
         alpha[i] = rule.alpha;
         destinationActive[destination.componentIndex] = 1;
         if (isDiscreteRule(rule)) destinationDiscrete[destination.componentIndex] = 1;
         const list = rulesByDestination.get(destination.componentIndex) || [];
+        if (list.length === 0) destinationDecay[destination.componentIndex] = rule.decay;
         list.push(rule);
         rulesByDestination.set(destination.componentIndex, list);
-      }
-
-      for (const [component, destinationRules] of rulesByDestination) {
-        destinationLimit[component] = destinationRules.every((rule) => rule.limitValue !== false) ? 1 : 0;
       }
 
       return {
@@ -625,12 +617,11 @@
         sigma,
         dt,
         gain,
-        decay,
+        destinationDecay,
         weight,
         alpha,
         destinationActive,
         destinationDiscrete,
-        destinationLimit,
       };
     }
 
@@ -773,12 +764,11 @@ uniform int uPositiveOnly[MAX_RULES];
 uniform int uDeltaMode[MAX_RULES];
 uniform int uDestinationActive[MAX_CHANNELS];
 uniform int uDestinationDiscrete[MAX_CHANNELS];
-uniform int uDestinationLimit[MAX_CHANNELS];
 uniform float uMu[MAX_RULES];
 uniform float uSigma[MAX_RULES];
 uniform float uDt[MAX_RULES];
 uniform float uGain[MAX_RULES];
-uniform float uDecay[MAX_RULES];
+uniform float uDestinationDecay[MAX_CHANNELS];
 uniform float uWeight[MAX_RULES];
 uniform float uAlpha[MAX_RULES];
 uniform bool uWrap;
@@ -850,12 +840,11 @@ float growthCurve(int ruleIndex, float n) {
   return 2.0 * exp(-squared / (2.0 * sigma * sigma)) - 1.0;
 }
 
-void finalizeChannel(inout vec3 state, int channel) {
+void finalizeChannel(inout vec3 state, vec3 current, int channel) {
   if (uDestinationActive[channel] == 0) return;
-  float value = readChannel(vec4(state, 0.0), channel);
+  float value = readChannel(vec4(state, 0.0), channel) - uDestinationDecay[channel] * readChannel(vec4(current, 0.0), channel);
   if (uDestinationDiscrete[channel] == 1) value = value > 0.5 ? 1.0 : 0.0;
-  else if (uDestinationLimit[channel] == 1) value = clamp01(value);
-  else value = max(0.0, value);
+  else value = clamp01(value);
   setChannel(state, channel, value);
 }
 
@@ -877,16 +866,15 @@ void main() {
       neighborhood += sampleSource(cell + offset, sourceChannel) * kernel.z;
     }
 
-    float currentDestination = readChannel(current, destinationChannel);
     float rawGrowth = growthCurve(ruleIndex, neighborhood) * uGain[ruleIndex];
     float growth = uPositiveOnly[ruleIndex] == 1 ? max(0.0, rawGrowth) : rawGrowth;
-    float delta = uDt[ruleIndex] * growth * uWeight[ruleIndex] - uDecay[ruleIndex] * currentDestination;
+    float delta = uDt[ruleIndex] * growth * uWeight[ruleIndex];
     addChannel(next, destinationChannel, delta);
   }
 
-  finalizeChannel(next, 0);
-  finalizeChannel(next, 1);
-  finalizeChannel(next, 2);
+  finalizeChannel(next, current.rgb, 0);
+  finalizeChannel(next, current.rgb, 1);
+  finalizeChannel(next, current.rgb, 2);
   outState = vec4(next, 0.0);
 }`;
 
@@ -1246,6 +1234,9 @@ void main() {
     }));
     const ids = new Set(channels.map((channel) => channel.id));
     const sourceRules = Array.isArray(model.rules) && model.rules.length ? model.rules : [model.rule || DEFAULT_RULE];
+    const sharedDt = Number.isFinite(Number(sourceRules[0]?.dt)) && Number(sourceRules[0]?.dt) > 0
+      ? Number(sourceRules[0].dt)
+      : DEFAULT_RULE.dt;
     const rules = sourceRules.map((rule, index) => {
       const fallbackId = channels[0]?.id || "channel-0";
       const sourceId = String(rule.sourceChannelId || rule.src || rule.source || fallbackId);
@@ -1255,6 +1246,7 @@ void main() {
         id: rule.id || `rule-${index}`,
         sourceChannelId: ids.has(sourceId) ? sourceId : fallbackId,
         destinationChannelId: ids.has(destinationId) ? destinationId : fallbackId,
+        dt: sharedDt,
       });
     });
     return {
@@ -1304,7 +1296,7 @@ void main() {
       dt: rule.dt,
       gain: rule.gain,
       decay: rule.decay,
-      limitValue: rule.limitValue,
+      limitValue: true,
       deltaName: rule.deltaName,
       coreName: rule.coreName,
       layer: rule.layer,
@@ -1327,7 +1319,7 @@ void main() {
       dt: Number(rule.dt ?? 0.1),
       gain: Number(rule.gain ?? 1),
       decay: Number(rule.decay ?? 0),
-      limitValue: rule.limitValue !== false,
+      limitValue: true,
       deltaName: rule.deltaName || "gaus",
       coreName: rule.coreName || "bump4",
       layer: Number(rule.layer || 0),

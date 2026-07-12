@@ -169,6 +169,9 @@ function normalizeModel(model = {}) {
   }));
   const ids = new Set(normalizedChannels.map((channel) => channel.id));
   const sourceRules = Array.isArray(model.rules) && model.rules.length ? model.rules : [model.rule || DEFAULT_RULE];
+  const sharedDt = Number.isFinite(Number(sourceRules[0]?.dt)) && Number(sourceRules[0]?.dt) > 0
+    ? Number(sourceRules[0].dt)
+    : DEFAULT_RULE.dt;
   const normalizedRules = sourceRules.map((rule, index) => {
     const fallbackId = normalizedChannels[0]?.id || "channel-0";
     const sourceId = String(rule.sourceChannelId || rule.src || rule.source || fallbackId);
@@ -178,6 +181,7 @@ function normalizeModel(model = {}) {
       id: rule.id || `rule-${index}`,
       sourceChannelId: ids.has(sourceId) ? sourceId : fallbackId,
       destinationChannelId: ids.has(destinationId) ? destinationId : fallbackId,
+      dt: sharedDt,
     });
   });
   return {
@@ -201,7 +205,7 @@ function normalizeRule(rule = {}) {
     dt: Number(rule.dt ?? 0.1),
     gain: Number(rule.gain ?? 1),
     decay: Number(rule.decay ?? 0),
-    limitValue: rule.limitValue !== false,
+    limitValue: true,
     deltaName: rule.deltaName || "gaus",
     coreName: rule.coreName || "bump4",
     layer: Number(rule.layer || 0),
@@ -538,7 +542,12 @@ function stepOnce(safeRect) {
     const source = channelMap.get(rule.sourceChannelId);
     const dest = channelMap.get(rule.destinationChannelId);
     if (!source || !dest) continue;
-    const ruleChunks = buildSimulationChunks(activeBefore.get(source.id) || new Set(), safeRect, rule);
+    const ruleChunks = buildSimulationChunks(
+      activeBefore.get(source.id) || new Set(),
+      activeBefore.get(dest.id) || new Set(),
+      safeRect,
+      rule,
+    );
     if (!ruleChunks.size) continue;
     simChunks = unionSets(simChunks, ruleChunks);
     if (!initializedDestinations.has(dest.id)) {
@@ -616,11 +625,10 @@ function applyRuleContribution(rule, source, dest, simChunks, safeRect, growthTo
           }
         }
 
-        const current = dest.field[index];
         const rawGrowth = growthFromLut(rule, neighborhood) * rule.gain;
         const growth = rule.positiveOnly ? Math.max(0, rawGrowth) : rawGrowth;
         growthTotal += growth * weight;
-        dest.next[index] += rule.dt * growth * weight - rule.decay * current;
+        dest.next[index] += rule.dt * growth * weight;
       }
     }
   }
@@ -629,7 +637,6 @@ function applyRuleContribution(rule, source, dest, simChunks, safeRect, growthTo
 
 function finalizeDestination(channel, chunks, rulesForChannel, safeRect) {
   const discrete = rulesForChannel.some(isDiscreteRule);
-  const shouldLimit = rulesForChannel.every((rule) => rule.limitValue !== false);
   for (const chunkId of chunks) {
     const bounds = intersectRects(chunkBounds(chunkId), safeRect);
     if (!bounds) continue;
@@ -637,15 +644,25 @@ function finalizeDestination(channel, chunks, rulesForChannel, safeRect) {
       const row = y * worldWidth;
       for (let x = bounds.left; x < bounds.right; x += 1) {
         const index = row + x;
-        const value = channel.next[index];
-        channel.next[index] = discrete ? (value > 0.5 ? 1 : 0) : shouldLimit ? clamp(value) : Math.max(0, value);
+        const value = channel.next[index] - (rulesForChannel[0]?.decay || 0) * channel.field[index];
+        channel.next[index] = discrete ? (value > 0.5 ? 1 : 0) : clamp(value);
       }
     }
   }
 }
 
-function buildSimulationChunks(sourceChunks, safeRect, rule) {
+function buildSimulationChunks(sourceChunks, destinationChunks, safeRect, rule) {
   const result = new Set();
+  const zeroGrowth = growthFromLut(rule, 0) * rule.gain;
+  const zeroContribution = rule.positiveOnly ? Math.max(0, zeroGrowth) : zeroGrowth;
+  const destinationNeedsUpdate = Math.abs(zeroContribution) > EPSILON || Math.abs(rule.decay) > EPSILON;
+
+  if (zeroContribution > EPSILON) return chunksForRect(safeRect);
+  if (destinationNeedsUpdate) {
+    for (const chunkId of destinationChunks) {
+      if (intersectRects(chunkBounds(chunkId), safeRect)) result.add(chunkId);
+    }
+  }
   if (!sourceChunks.size) return result;
   if (wrapAround) return chunksForRect(safeRect);
   const radius = Math.ceil(rule.radius);

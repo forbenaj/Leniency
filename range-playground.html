@@ -65,7 +65,7 @@
         </label>
 
         <div class="metrics">
-          <div><span>Backend</span><strong id="backendLabel">CPU</strong></div>
+          <div><span>Backend</span><strong id="backendLabel">Auto</strong></div>
           <div><span>Mass</span><strong id="massLabel">0.0000</strong></div>
           <div><span>Growth</span><strong id="growthLabel">0.0000</strong></div>
           <div><span>Energy</span><strong id="energyLabel">0.0000</strong></div>
@@ -201,7 +201,7 @@
           <select id="backendSelect">
             <option value="auto">Auto</option>
             <option value="webgl">WebGL</option>
-            <option value="cpu" selected>CPU</option>
+            <option value="cpu">CPU</option>
           </select>
         </label>
 
@@ -247,7 +247,12 @@
 
         <label class="check-row">
           <input id="limitToggle" type="checkbox" checked />
-          <span>Clamp values</span>
+          <span>Clamp values (required)</span>
+        </label>
+
+        <label class="check-row">
+          <input id="positiveOnlyToggle" type="checkbox" />
+          <span>Positive-only growth</span>
         </label>
 
         <label class="check-row">

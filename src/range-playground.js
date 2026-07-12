@@ -75,6 +75,7 @@ const ui = {
   gameMaxZoomSlider: document.querySelector("#gameMaxZoomSlider"),
   gameMaxZoomValue: document.querySelector("#gameMaxZoomValue"),
   limitToggle: document.querySelector("#limitToggle"),
+  positiveOnlyToggle: document.querySelector("#positiveOnlyToggle"),
   wrapToggle: document.querySelector("#wrapToggle"),
   colorInputs: [
     document.querySelector("#color0"),
@@ -268,7 +269,7 @@ let snapshotRequestId = 0;
 const pendingSnapshotRequests = new Map();
 let webglSim = null;
 let webglUnavailableReason = "";
-let backendPreference = "cpu";
+let backendPreference = "auto";
 let activeBackend = "cpu";
 let lastFrameAt = 0;
 let renderFrameCount = 0;
@@ -1022,6 +1023,7 @@ function cloneRule(rule) {
   return {
     ...DEFAULT_RULE,
     ...rule,
+    limitValue: true,
     sourceChannelId,
     destinationChannelId,
     beta: [...(rule?.beta || DEFAULT_RULE.beta)],
@@ -1087,7 +1089,7 @@ function createCrossChannelRule(src, dst, overrides = {}) {
     sourceChannelId: src,
     destinationChannelId: dst,
     weight: Number(overrides.weight ?? 0.35),
-    positiveOnly: overrides.positiveOnly !== false,
+    positiveOnly: overrides.positiveOnly === true,
   });
 }
 
@@ -1101,15 +1103,21 @@ function crossRulesForChannel(channelId) {
 
 function writeSelectedRuleFromControls() {
   const rule = selectedRule();
+  const dt = Number(ui.dtSlider.value);
+  const decay = Number(ui.decaySlider.value);
+  const positiveOnly = Boolean(ui.positiveOnlyToggle?.checked);
   rule.radius = Number(ui.radiusSlider.value);
   rule.alpha = Number(ui.alphaSlider.value);
   rule.mu = Number(ui.muSlider.value);
   rule.sigma = Number(ui.sigmaSlider.value);
-  rule.dt = Number(ui.dtSlider.value);
   rule.gain = Number(ui.gainSlider.value);
-  rule.decay = Number(ui.decaySlider.value);
-  rule.limitValue = ui.limitToggle.checked;
+  rule.limitValue = true;
   rule.wrapAround = ui.wrapToggle.checked;
+  for (const item of rules) {
+    item.dt = dt;
+    item.decay = decay;
+    if (item.destinationChannelId === selectedChannelId) item.positiveOnly = positiveOnly;
+  }
   currentRule = rule;
 }
 
@@ -1122,7 +1130,9 @@ function syncRuleControls(rule = selectedRule()) {
   setSliderValue(ui.dtSlider, rule.dt);
   setSliderValue(ui.gainSlider, rule.gain);
   setSliderValue(ui.decaySlider, rule.decay);
-  ui.limitToggle.checked = rule.limitValue !== false;
+  ui.limitToggle.checked = true;
+  ui.limitToggle.disabled = true;
+  if (ui.positiveOnlyToggle) ui.positiveOnlyToggle.checked = Boolean(rule.positiveOnly);
   syncLabels();
 }
 
@@ -1169,7 +1179,7 @@ function simulationModel() {
       dt: rule.dt,
       gain: rule.gain,
       decay: rule.decay,
-      limitValue: rule.limitValue,
+      limitValue: true,
       deltaName: rule.deltaName,
       coreName: rule.coreName,
       layer: rule.layer,
@@ -1280,7 +1290,7 @@ function currentConfig() {
     dt: Number(ui.dtSlider.value),
     gain: Number(ui.gainSlider.value),
     decay: Number(ui.decaySlider.value),
-    limitValue: ui.limitToggle.checked,
+    limitValue: true,
     wrapAround: ui.wrapToggle.checked,
     deltaName: rule.deltaName,
     coreName: rule.coreName,
@@ -1875,7 +1885,9 @@ function resetAdvanced() {
   ui.gainSlider.value = String(DEFAULT_ADVANCED.gain);
   ui.decaySlider.value = String(DEFAULT_ADVANCED.decay);
   ui.safeSlider.value = String(DEFAULT_ADVANCED.safe);
-  ui.limitToggle.checked = DEFAULT_ADVANCED.limitValue;
+  ui.limitToggle.checked = true;
+  ui.limitToggle.disabled = true;
+  if (ui.positiveOnlyToggle) ui.positiveOnlyToggle.checked = false;
   ui.wrapToggle.checked = DEFAULT_ADVANCED.wrapAround;
   const channel = selectedChannel();
   const defaultPalette = channel?.id === "channel-0" ? DEFAULT_COLORS : NEW_LAYER_PALETTES[nextLayerPaletteIndex % NEW_LAYER_PALETTES.length];
@@ -2000,7 +2012,7 @@ function addLayer() {
       createCrossChannelRule(id, baseChannelId, {
         id: `rule-${id}-feeds-${baseChannelId}`,
         weight: 0.16,
-        positiveOnly: true,
+        positiveOnly: false,
       }),
     );
   }
@@ -2009,7 +2021,7 @@ function addLayer() {
       createCrossChannelRule(baseChannelId, id, {
         id: `rule-${baseChannelId}-feeds-${id}`,
         weight: 0.12,
-        positiveOnly: true,
+        positiveOnly: false,
       }),
     );
   }
@@ -3144,7 +3156,9 @@ function bindEvents() {
     });
   }
 
-  ui.limitToggle.addEventListener("change", configureBackend);
+  ui.limitToggle.checked = true;
+  ui.limitToggle.disabled = true;
+  ui.positiveOnlyToggle?.addEventListener("change", configureBackend);
   ui.wrapToggle.addEventListener("change", configureBackend);
   ui.gameBackgroundSelect.addEventListener("change", () => {
     gameStarfield.reset();
